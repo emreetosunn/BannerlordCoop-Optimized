@@ -1,117 +1,76 @@
 # BannerlordCoop-Optimized
 
-Maintained by [emreetosunn](https://github.com/emreetosunn).
+An independent development edition of the Mount & Blade II: Bannerlord co-op campaign mod, maintained by [emreetosunn](https://github.com/emreetosunn).
 
-This independent development repository is based on [BannerlordCoop](https://github.com/Bannerlord-Coop-Team/BannerlordCoop). The original authors retain credit for the upstream project. The existing [LICENSE](LICENSE) and third-party notices are preserved.
+[Report an issue](https://github.com/emreetosunn/BannerlordCoop-Optimized/issues) · [Source code](https://github.com/emreetosunn/BannerlordCoop-Optimized/tree/development) · [License](LICENSE)
 
-Optimization work is planned. This initial import contains no new performance improvements or benchmark claims. The documentation below describes the upstream project; its downloads and community links belong to the original team.
+## Overview
 
----
+Play a shared Bannerlord campaign with other players, each controlling their own character and party. The codebase includes campaign synchronization, multiplayer battles, client connections, and dedicated server support.
 
-![Bannerlord Coop](img/Banner.png)
+This repository is based on [BannerlordCoop](https://github.com/Bannerlord-Coop-Team/BannerlordCoop). Development and issue tracking for this edition take place here.
 
-# Bannerlord Coop
+## Current status
 
-**Experience the Mount & Blade II: Bannerlord campaign with your friends.**
+This is a source-code development repository. No downloadable release has been published for this edition yet.
 
-Build armies, manage kingdoms, fight battles, trade, raid settlements, and conquer Calradia together in a shared multiplayer campaign.
+The initial code import is complete. Performance and stability improvements are planned; no new gameplay optimizations or measured performance gains have been delivered by this edition yet. The project name describes the development goal.
 
-[Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3770450698) &nbsp;•&nbsp;
-[Discord](https://discord.gg/VXqGyT8) &nbsp;•&nbsp;
-[Reddit](https://www.reddit.com/r/BannerlordCoop/) &nbsp;•&nbsp;
-[Support the project](#support-bannerlord-coop)
+## Development priorities
 
-## About the Mod
+- Establish reproducible build and test results.
+- Measure networking, serialization, and frame-time costs before changing behavior.
+- Reduce unnecessary allocations and repeated work where measurements justify it.
+- Validate campaign synchronization and multiplayer stability after changes.
+- Publish release notes with tested changes and known limitations.
 
-Bannerlord Coop transforms Bannerlord's single-player campaign into a cooperative multiplayer experience.
+These are planned areas of work, not a list of completed features.
 
-Players share the same persistent campaign world while controlling their own characters, parties, clans, troops, and resources. Travel across the campaign map together, interact with settlements and NPC parties, or fight alongside — and against — other players.
+## Getting started
 
-The mod is currently optimized for campaigns with up to **8 players**. Larger groups may work, but could experience reduced performance and stability.
+Clone the development branch:
 
-## Installation
+```sh
+git clone --branch development https://github.com/emreetosunn/BannerlordCoop-Optimized.git
+cd BannerlordCoop-Optimized
+```
 
-Subscribe on the [Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3770450698), then enable the **Coop** module in the Bannerlord launcher.
+Building the mod requires a Windows development environment, a local Bannerlord installation, Visual Studio/MSBuild, and the .NET tooling required by the projects. The main solution is `source/Coop.sln`. Game references are resolved through an `mb2` junction to the game installation.
 
-Join our [Discord](https://discord.gg/VXqGyT8) for installation help, announcements, bug reports, playtests, and community discussion.
+Review `prepare-links.ps1` and `runmefirst.cmd` before running the repository setup. The setup also configures optional local testing tools; see the [testing tool setup](doc/automated-testing/mcp-setup.md).
 
-## Hosting
+To build the mod without deploying it into the game installation, run from a Visual Studio Developer Command Prompt after restoring dependencies and configuring the game path:
 
-For the best performance and stability, we strongly recommend hosting campaigns through the included **dedicated server**. [The hosting instructions can be found in our Discord through this link.](https://discord.gg/2MRuH9fVVV)
+```bat
+nuget restore source\Coop.sln
+MSBuild.exe source\Coop\Coop.csproj /p:Configuration=Release /p:Platform=AnyCPU /p:ModName=
+```
 
-Steam hosting does not require traditional port forwarding in most cases. Manual network hosting options are also available.
+Builds with deployment enabled can write into the game's `Modules` directory. Full game-dependent builds and multiplayer testing have not yet been validated for this edition.
 
-Dedicated-server operators can block Steam64 identities with a [server-side ban list](doc/SteamBans.md).
+## Testing and compatibility
 
-Server setup walkthrough: https://www.youtube.com/watch?v=laZM967Eals
+Use identical mod builds and game versions on all participating machines. The imported project documentation targets Bannerlord **v1.4.8**, with other mods and the War Sails DLC disabled; this edition has not independently verified that compatibility baseline.
 
-## Roadmap
+Test projects are located alongside the application projects under `source/`. Game-dependent tests require the corresponding game assemblies and runtime environment.
 
-https://bannerlordcoop.com/#roadmap
+Useful technical references:
 
-## Multiplayer Battles
+- [Client and connection states](doc/ClientAndConnectionStates.md)
+- [Server data locations](doc/ServerDataLocations.md)
+- [Server-side Steam bans](doc/SteamBans.md)
+- [Proximity voice](doc/ProximityVoice.md)
 
-Players can participate in field battles and sieges as allies or opponents. AI parties may also join active battles under supported campaign conditions.
+These documents were imported with the codebase and may describe upstream behavior or tooling.
 
-Players who retreat or disconnect are handled by the campaign and battle synchronization systems, allowing the shared game to continue without ending the entire session.
+## Bug reports and contributions
 
-## Compatibility
+Use [this repository's issue tracker](https://github.com/emreetosunn/BannerlordCoop-Optimized/issues) for this edition. Include the commit or build used, game version, player count, reproduction steps, expected and actual behavior, and relevant client/server logs. Remove passwords and other private information before uploading logs.
 
-For the most reliable experience:
+Keep contributions focused. Performance changes should include a reproducible comparison; synchronization changes should include tests or a concrete multiplayer verification procedure.
 
-- Use the supported Bannerlord game version (currently **v1.4.8**)
-- Disable all other mods
-- Do not enable the War Sails DLC
-- Ensure every player is using the same mod version
+## Credits and license
 
-Compatibility with other mods is not guaranteed.
+Original code: the BannerlordCoop contributors. Independent repository maintenance: [emreetosunn](https://github.com/emreetosunn). NoHarmony: [Salminar](https://github.com/Salminar/NoHarmony).
 
-## Feedback and Bug Reports
-
-Please share your honest experience with the mod — good or bad. Detailed feedback and reproducible bug reports are extremely valuable and help us improve stability, performance, and gameplay.
-
-Report bugs in our [Discord](https://discord.gg/VXqGyT8) or via [GitHub issues](https://github.com/Bannerlord-Coop-Team/BannerlordCoop/issues), and please include:
-
-- What happened
-- What you expected to happen
-- Steps that reproduce the problem
-- Relevant screenshots, videos, or log files
-- The number of connected players
-
-## Support Bannerlord Coop
-
-Bannerlord Coop is developed by a volunteer team and will always be available for free.
-
-Support helps cover development tools, hosting infrastructure, dedicated servers, distribution costs, and other project expenses. Choose whichever platform works best for you:
-
-- [**Patreon**](https://www.patreon.com/16338430/join) — Become a monthly supporter
-- [**Buy Me a Coffee**](https://buymeacoffee.com/bannerlordcoop) — Send a one-time contribution
-- [**PayPal**](https://www.paypal.com/donate/?hosted_button_id=KHBSK4FXQ9GKS) — Donate directly
-- [**Afdian**](https://ifdian.net/a/BannerlordCoop) — Support us from China
-- [**Boosty**](https://boosty.to/bannerlordcoop/donate) — Additional international support option
-
-**Financial support is completely optional.** Playing the mod, reporting bugs, creating content, and sharing Bannerlord Coop also help the project tremendously.
-
-## Contributing
-
-Get started [here!](https://github.com/Bannerlord-Coop-Team/BannerlordCoop/wiki/Getting-Started-as-a-Contributor) Also join our [Discord](https://discord.gg/VXqGyT8) for direct questions and collaboration.
-
-Debug builds of the in-game server always try to load a campaign save named `MP` when the server starts: a plain `/server` launch loads nothing else, and a `/coopsave <name>` launch attempts `MP` before the named save. A missing `MP` save is skipped with `Failed to load save with name MP` in the server log, so create a game and save it as `MP` before hosting from a Debug build; the [Environment Setup Guide](https://github.com/Bannerlord-Coop-Team/BannerlordCoop/wiki/Environment-Setup-Guide) wiki page covers this under Windows Setup (create a new game and save it as MP). Release builds skip `MP` and load only the save picked in the host screen or passed with `/coopsave`.
-
-By submitting a contribution to BannerlordCoop, you agree that your contribution
-may be used, modified, distributed, sublicensed, and relicensed by the
-BannerlordCoop project maintainers as part of the BannerlordCoop project.
-
-You also confirm that you have the right to submit the contribution and that it
-does not knowingly include code copied from another project without permission.
-
-## FAQ
-
-Please read through [the #faq channel in our discord server](https://discord.gg/VXqGyT8).
-
-## License
-
-Bannerlord Coop is source-available, not open source. The code may be viewed and contributed to, but it may not be copied, redistributed, relicensed, or used in another project without written permission from the maintainers. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for the full terms.
-
-### Acknowledgments
-- Salminar for [NoHarmony](https://github.com/Salminar/NoHarmony).
+The existing source-available license is unchanged. See [LICENSE](LICENSE), [NOTICE.md](NOTICE.md), and the bundled [third-party notices](deploy/ThirdPartyNotices/README.txt). Public source access does not itself grant unrestricted reuse or redistribution rights.
