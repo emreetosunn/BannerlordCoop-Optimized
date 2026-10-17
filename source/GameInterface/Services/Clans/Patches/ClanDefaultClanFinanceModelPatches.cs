@@ -1,0 +1,112 @@
+﻿using Common.Messaging;
+using GameInterface.Services.Clans.Extensions;
+using GameInterface.Services.Clans.Interfaces;
+using GameInterface.Services.MobileParties.Extensions;
+using GameInterface.Services.UI.Notifications.Messages;
+using HarmonyLib;
+using System;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.GameComponents;
+using TaleWorlds.CampaignSystem.Party;
+
+namespace GameInterface.Services.Clans.Patches;
+
+[HarmonyPatch(typeof(DefaultClanFinanceModel))]
+[HarmonyPatchCategory(GameInterface.HARMONY_GAME_STARTED_CATEGORY)]
+internal class DefaultClanFinanceModelPatches
+{
+    [HarmonyPatch(nameof(DefaultClanFinanceModel.AddExpenseFromLeaderParty))]
+    [HarmonyPrefix]
+    public static bool AddExpenseFromLeaderPartyPrefix(DefaultClanFinanceModel __instance, Clan clan, ExplainedNumber goldChange, bool applyWithdrawals, ref int __result)
+    {
+        ContainerProvider.TryResolve<IDefaultClanFinanceModelInterface>(out var financeModelInterface);
+
+        __result = financeModelInterface.AddExpenseFromLeaderParty(__instance, clan, goldChange, applyWithdrawals);
+
+        return false;
+    }
+
+    [HarmonyPatch(nameof(DefaultClanFinanceModel.CalculateClanIncomeInternal))]
+    [HarmonyPrefix]
+    public static bool CalculateClanIncomeInternalPrefix(DefaultClanFinanceModel __instance, Clan clan, ref ExplainedNumber goldChange, bool applyWithdrawals = false, bool includeDetails = false)
+    {
+        ContainerProvider.TryResolve<IDefaultClanFinanceModelInterface>(out var financeModelInterface);
+
+        financeModelInterface.CalculateClanIncomeInternal(__instance, clan, ref goldChange, applyWithdrawals, includeDetails);
+
+        return false;
+    }
+
+    [HarmonyPatch(nameof(DefaultClanFinanceModel.CalculateClanExpensesInternal))]
+    [HarmonyPrefix]
+    public static bool CalculateClanExpensesInternalPrefix(DefaultClanFinanceModel __instance, Clan clan, ref ExplainedNumber goldChange, bool applyWithdrawals = false, bool includeDetails = false)
+    {
+        // Calculate for non-player clans normally
+        if (clan == null || !clan.IsPlayerClan()) return true;
+
+        ContainerProvider.TryResolve<IDefaultClanFinanceModelInterface>(out var financeModelInterface);
+
+        financeModelInterface.CalculateClanExpensesForPlayerClan(__instance, clan, ref goldChange, applyWithdrawals, includeDetails);
+
+        return false;
+    }
+
+    [ThreadStatic]
+    private static float initialRecentEventsMorale;
+
+    [HarmonyPatch(nameof(DefaultClanFinanceModel.ApplyMoraleEffect))]
+    [HarmonyPrefix]
+    public static void ApplyMoraleEffectPrefix(DefaultClanFinanceModel __instance, MobileParty mobileParty, int wage, int paymentAmount)
+    {
+        initialRecentEventsMorale = mobileParty.RecentEventsMorale;
+    }
+
+    [HarmonyPatch(nameof(DefaultClanFinanceModel.ApplyMoraleEffect))]
+    [HarmonyPostfix]
+    public static void ApplyMoraleEffectPostfix(DefaultClanFinanceModel __instance, MobileParty mobileParty, int wage, int paymentAmount)
+    {
+        if (paymentAmount < wage && wage > 0 && mobileParty.IsPlayerParty())
+        {
+            MessageBroker.Instance.Publish(__instance, new NotifyMoraleLossDueToFunds(mobileParty, mobileParty.RecentEventsMorale - initialRecentEventsMorale));
+        }
+    }
+
+    [HarmonyPatch(nameof(DefaultClanFinanceModel.AddPartyExpense))]
+    [HarmonyPrefix]
+    public static bool AddPartyExpensePrefix(DefaultClanFinanceModel __instance, ref int __result, MobileParty party, Clan clan, ExplainedNumber goldChange, bool applyWithdrawals)
+    {
+        // Coop clan members pay their own wages, without NPC party gold top-ups.
+        if (party.IsPlayerParty())
+        {
+            __result = 0;
+            return false;
+        }
+
+        ContainerProvider.TryResolve<IDefaultClanFinanceModelInterface>(out var financeModelInterface);
+
+        __result = financeModelInterface.AddPartyExpense(__instance, party, clan, goldChange, applyWithdrawals);
+
+        return false;
+    }
+
+    [HarmonyPatch(nameof(DefaultClanFinanceModel.CalculateClanGoldChange))]
+    [HarmonyPrefix]
+    public static bool CalculateClanGoldChangePrefix(Clan clan)
+    {
+        if (clan.Leader?.Clan != clan) return false;
+
+        ContainerProvider.TryResolve<IClanFinance>(out var finance);
+
+        return finance.CanChangeGold(clan.Leader);
+    }
+
+    [HarmonyPatch(nameof(DefaultClanFinanceModel.AddIncomeFromParty))]
+    [HarmonyPrefix]
+    public static bool AddIncomeFromPartyPrefix(MobileParty party, ref int __result)
+    {
+        if (!party.IsPlayerParty()) return true;
+
+        __result = 0;
+        return false;
+    }
+}

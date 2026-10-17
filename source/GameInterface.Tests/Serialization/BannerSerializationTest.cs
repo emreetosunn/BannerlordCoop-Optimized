@@ -1,0 +1,49 @@
+﻿using Autofac;
+using Common.Serialization;
+using GameInterface.Serialization;
+using GameInterface.Serialization.External;
+using GameInterface.Tests.Bootstrap.Modules;
+using System.Linq;
+using TaleWorlds.Core;
+using Xunit;
+
+namespace GameInterface.Tests.Serialization.SerializerTests
+{
+    public class BannerSerializationTest
+    {
+        ILifetimeScope container;
+        public BannerSerializationTest()
+        {
+            container = SerializationTestContainer.BeginScope();
+        }
+
+        [Fact]
+        public void Banner_Full_Serialization()
+        {
+            Banner testBanner = new Banner();
+
+            var factory = container.Resolve<IBinaryPackageFactory>();
+            BannerBinaryPackage package = new BannerBinaryPackage(testBanner, factory);
+
+            package.Pack();
+
+            byte[] bytes = BinaryPackageSerializer.Serialize(package);
+
+            Assert.NotEmpty(bytes);
+
+            object obj = BinaryPackageSerializer.Deserialize(bytes);
+
+            Assert.IsType<BannerBinaryPackage>(obj);
+
+            BannerBinaryPackage returnedPackage = (BannerBinaryPackage)obj;
+
+            var deserializeFactory = container.Resolve<IBinaryPackageFactory>();
+            Banner newBanner = returnedPackage.Unpack<Banner>(deserializeFactory);
+
+            foreach (var data in testBanner.BannerDataList.Zip(newBanner.BannerDataList, (bannerData, newBannerData) => new { bannerData, newBannerData }))
+            {
+                Assert.Equal(data.bannerData, data.newBannerData);
+            }
+        }
+    }
+}

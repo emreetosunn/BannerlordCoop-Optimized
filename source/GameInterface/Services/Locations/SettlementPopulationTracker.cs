@@ -1,0 +1,325 @@
+﻿using Common;
+using Common.Logging;
+using Common.Messaging;
+using Common.Network;
+using GameInterface.Services.Heroes.Extensions;
+using GameInterface.Services.Locations.Messages;
+using GameInterface.Services.MobileParties.Extensions;
+using GameInterface.Services.ObjectManager;
+using GameInterface.Services.Players;
+using LiteNetLib;
+using Serilog;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.CampaignBehaviors;
+using TaleWorlds.CampaignSystem.Party;
+using TaleWorlds.CampaignSystem.Settlements;
+using TaleWorlds.CampaignSystem.Settlements.Locations;
+
+namespace GameInterface.Services.Locations;
+
+/// <summary>
+/// Server-side orchestrator that populates settlement location rosters when player parties visit.
+/// The vanilla population logic is gated on the local player being inside the settlement, which is
+/// never true on the server, so this tracker drives the equivalent hero placement from the synced
+/// settlement enter/leave messages; the patched mutators broadcast every resulting change.
+/// A disconnected player's party stays parked inside its settlement, so it intentionally keeps
+/// counting as a visitor here - the rosters then keep matching the actual campaign state.
+/// </summary>
+internal class SettlementPopulationTracker : IHandler
+{
+    private static readonly ILogger Logger = LogManager.GetLogger<SettlementPopulationTracker>();
+
+    private readonly IMessageBroker messageBroker;
+    private readonly INetwork network;
+    private readonly IObjectManager objectManager;
+    private readonly FixedTownNpcService fixedTownNpcService;
+    private readonly ISettlementHeroSpawnPool heroSpawnPool;
+    private readonly IPlayerManager playerManager;
+
+    // Keyed by Settlement.StringId; holds the settlement so cleanup never rescans the campaign.
+    private readonly Dictionary<string, Settlement> populatedSettlements = new Dictionary<string, Settlement>();
+    private readonly Dictionary<string, string> playerPartySettlements = new Dictionary<string, string>();
+
+    public SettlementPopulationTracker(
+        IMessageBroker messageBroker,
+        INetwork network,
+        IObjectManager objectManager,
+        FixedTownNpcService fixedTownNpcService,
+        ISettlementHeroSpawnPool heroSpawnPool,
+        IPlayerManager playerManager)
+    {
+        this.messageBroker = messageBroker;
+        this.network = network;
+        this.objectManager = objectManager;
+        this.fixedTownNpcService = fixedTownNpcService;
+        this.heroSpawnPool = heroSpawnPool;
+        this.playerManager = playerManager;
+
+        messageBroker.Subscribe<SettlementRosterHeroesChanged>(Handle_SettlementRosterHeroesChanged);
+        messageBroker.Subscribe<NetworkRequestLocationRosterSnapshot>(Handle_NetworkRequestLocationRosterSnapshot);
+    }
+
+    public void Dispose()
+    {
+        messageBroker.Unsubscribe<SettlementRosterHeroesChanged>(Handle_SettlementRosterHeroesChanged);
+        messageBroker.Unsubscribe<NetworkRequestLocationRosterSnapshot>(Handle_NetworkRequestLocationRosterSnapshot);
+    }
+
+    /// <summary>
+    /// Invoked by <c>SettlementInterface.PartyEnterSettlement</c> after a party's settlement entry is applied.
+    /// </summary>
+    public void OnPartyEnteredSettlement(Settlement settlement, MobileParty party)
+    {
+        if (ModInformation.IsServer == false) return;
+        if (settlement == null || party == null) return;
+
+        GameThread.RunSafe(() =>
+        {
+            if (objectManager.TryGetIdWithLogging(settlement, out var settlementId) == false) return;
+            if (objectManager.TryGetIdWithLogging(party, out var partyId) == false) return;
+            if (settlement.LocationComplex == null) return;
+
+            if (party.IsPlayerParty())
+            {
+                playerPartySettlements[partyId] = settlementId;
+
+                if (populatedSettlements.ContainsKey(settlement.StringId) == false)
+                {
+                    populatedSettlements.Add(settlement.StringId, settlement);
+                    PopulateSettlement(settlement);
+                }
+
+                // The visiting client's vanilla LocationEncounter spawns its own accompanying companions.
+                // They are deliberately absent from this server roster; their owner announces them over the
+                // mission mesh and every other client creates controller-less puppets.
+                BroadcastRosterSnapshot(settlement, settlementId);
+            }
+            else if (HasPlayerVisitors(settlementId) && party.LeaderHero != null)
+            {
+                // An AI lord arriving while players are inside; vanilla's placement driver is
+                // inert on the server, so place the leader explicitly.
+                RefreshHeroPlacement(party.LeaderHero, settlement);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Invoked by <c>SettlementInterface.PartyLeaveSettlement</c> after a party's settlement exit is applied.
+    /// </summary>
+    public void OnPartyLeftSettlement(MobileParty party)
+    {
+        if (ModInformation.IsServer == false) return;
+        if (party == null) return;
+
+        GameThread.RunSafe(() =>
+        {
+            if (objectManager.TryGetIdWithLogging(party, out var partyId) == false) return;
+
+            if (playerPartySettlements.TryGetValue(partyId, out var settlementId) == false)
+            {
+                RemoveAiLeaderPlacement(partyId);
+                return;
+            }
+
+            playerPartySettlements.Remove(partyId);
+
+            if (objectManager.TryGetObjectWithLogging(settlementId, out Settlement settlement) == false) return;
+
+            if (HasPlayerVisitors(settlementId) == false)
+            {
+                ClearSettlementRosters(settlement);
+                populatedSettlements.Remove(settlement.StringId);
+            }
+        });
+    }
+
+    // Vanilla refreshes hero placement on governor and prisoner events, but only for the settlement
+    // the local player is inside; the host is never inside one. Apply the same refresh for any
+    // settlement that currently has player visitors, then re-broadcast the roster so clients inside
+    // it update live instead of only on their next entry.
+    private void Handle_SettlementRosterHeroesChanged(MessagePayload<SettlementRosterHeroesChanged> payload)
+    {
+        if (!ModInformation.IsServer) return;
+
+        var settlement = payload.What.Settlement;
+        var heroes = payload.What.Heroes;
+        if (settlement == null || heroes == null) return;
+
+        GameThread.RunSafe(() =>
+        {
+            if (!populatedSettlements.ContainsKey(settlement.StringId)) return;
+            if (settlement.LocationComplex == null) return;
+
+            var ambientCandidates = new HashSet<Hero>(heroSpawnPool.GetAmbientCandidates(settlement));
+            var reconciled = false;
+            foreach (var hero in heroes)
+            {
+                if (hero == null) continue;
+
+                if (ambientCandidates.Contains(hero))
+                {
+                    RefreshHeroPlacement(hero, settlement);
+                    reconciled = true;
+                }
+                else if (settlement.LocationComplex.GetLocationOfCharacter(hero) != null)
+                {
+                    // Player-party companions use the mission mesh, so remove an older ambient entry directly.
+                    settlement.LocationComplex.RemoveCharacterIfExists(hero);
+                    reconciled = true;
+                }
+            }
+
+            if (!reconciled) return;
+            if (!objectManager.TryGetIdWithLogging(settlement, out var settlementId)) return;
+
+            BroadcastRosterSnapshot(settlement, settlementId);
+        });
+    }
+
+    /// <summary>
+    /// Allows the debug command to populate and broadcast a settlement without a visiting party.
+    /// </summary>
+    public void DebugPopulate(Settlement settlement)
+    {
+        if (ModInformation.IsServer == false) return;
+        if (settlement?.LocationComplex == null) return;
+
+        GameThread.RunSafe(() =>
+        {
+            if (objectManager.TryGetIdWithLogging(settlement, out var settlementId) == false) return;
+
+            if (populatedSettlements.ContainsKey(settlement.StringId) == false)
+            {
+                populatedSettlements.Add(settlement.StringId, settlement);
+                PopulateSettlement(settlement);
+            }
+
+            BroadcastRosterSnapshot(settlement, settlementId);
+        });
+    }
+
+    // The visitor bookkeeping is deliberately message-driven rather than derived from
+    // Settlement.Parties: the game-state apply of an enter/leave runs asynchronously on the main
+    // thread, so the live party list may not reflect the message that is being handled yet.
+    private bool HasPlayerVisitors(string settlementId)
+    {
+        return playerPartySettlements.ContainsValue(settlementId);
+    }
+
+    private void PopulateSettlement(Settlement settlement)
+    {
+        if (!TryGetHeroAgentSpawnCampaignBehavior(out var behavior)) return;
+
+        foreach (var hero in heroSpawnPool.GetAmbientCandidates(settlement))
+        {
+            try
+            {
+                behavior.RefreshLocationOfHeroForSettlement(hero, settlement);
+            }
+            catch (Exception e)
+            {
+                Logger.Warning(e, "Failed to place {Hero} in {Settlement}", hero.StringId, settlement.StringId);
+            }
+        }
+
+        fixedTownNpcService.Populate(settlement);
+    }
+
+    private void RefreshHeroPlacement(Hero hero, Settlement settlement)
+    {
+        if (!TryGetHeroAgentSpawnCampaignBehavior(out var behavior)) return;
+
+        try
+        {
+            behavior.RefreshLocationOfHeroForSettlement(hero, settlement);
+        }
+        catch (Exception e)
+        {
+            Logger.Warning(e, "Failed to place {Hero} in {Settlement}", hero.StringId, settlement.StringId);
+        }
+    }
+
+    private void RemoveAiLeaderPlacement(string partyId)
+    {
+        if (objectManager.TryGetObject(partyId, out MobileParty party) == false) return;
+
+        var leaderHero = party?.LeaderHero;
+        if (leaderHero == null || party.IsPlayerParty()) return;
+
+        // The leave may already have been applied, so the party's settlement can be gone; check
+        // every populated settlement instead (there are only as many as there are visited towns).
+        foreach (var settlement in populatedSettlements.Values)
+        {
+            settlement.LocationComplex?.RemoveCharacterIfExists(leaderHero);
+        }
+    }
+
+    private void ClearSettlementRosters(Settlement settlement)
+    {
+        foreach (var location in settlement.LocationComplex.GetListOfLocations())
+        {
+            if (location.GetCharacterList()?.Any() != true) continue;
+
+            // The patched mutator publishes the broadcast for this clear.
+            location.RemoveAllCharacters();
+        }
+    }
+
+    private void BroadcastRosterSnapshot(Settlement settlement, string settlementId)
+    {
+        var entries = new List<LocationCharacterData>();
+
+        foreach (var location in settlement.LocationComplex.GetListOfLocations())
+        {
+            if (objectManager.TryGetId(location, out var locationId) == false) continue;
+
+            foreach (var locationCharacter in location.GetCharacterList() ?? Enumerable.Empty<LocationCharacter>())
+            {
+                // Players are represented inside interiors by the P2P mission layer, never by the
+                // location roster. Excluding them here (server is authoritative on who is a player)
+                // keeps clients from spawning a frozen roster duplicate next to the P2P agent.
+                var hero = locationCharacter?.Character?.HeroObject;
+                if (hero != null && hero.IsPlayerHero()) continue;
+
+                if (LocationCharacterFactory.TryCreateData(objectManager, locationId, locationCharacter, out var data))
+                {
+                    entries.Add(data);
+                }
+            }
+        }
+
+        network.SendAll(new NetworkLocationRosterSnapshot(settlementId, entries.ToArray()));
+    }
+
+    private void Handle_NetworkRequestLocationRosterSnapshot(MessagePayload<NetworkRequestLocationRosterSnapshot> obj)
+    {
+        if (ModInformation.IsClient || obj.Who is not NetPeer peer) return;
+
+        var data = obj.What;
+
+        GameThread.RunSafe(() =>
+        {
+            if (!playerManager.TryGetPlayer(peer, out var player)) return;
+
+            if (!objectManager.TryGetObjectWithLogging<MobileParty>(player.MobilePartyId, out var party)) return;
+            if (!objectManager.TryGetObjectWithLogging<Settlement>(data.SettlementId, out var settlement)) return;
+
+            if (party.CurrentSettlement != settlement) return;
+
+            // A loaded player party is already inside, run the settlement-entry event to restore the roster
+            OnPartyEnteredSettlement(settlement, party);
+        });
+    }
+
+    private bool TryGetHeroAgentSpawnCampaignBehavior(out HeroAgentSpawnCampaignBehavior heroAgentSpawnBehavior)
+    {
+        heroAgentSpawnBehavior = Campaign.Current?.GetCampaignBehavior<HeroAgentSpawnCampaignBehavior>();
+        if (heroAgentSpawnBehavior != null) return true;
+
+        Logger.Debug("Skipping hero agent spawn update because the campaign behavior is unavailable");
+        return false;
+    }
+}

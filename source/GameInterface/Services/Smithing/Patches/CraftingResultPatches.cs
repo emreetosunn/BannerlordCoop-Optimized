@@ -1,0 +1,75 @@
+﻿using Common.Logging;
+using GameInterface.Policies;
+using HarmonyLib;
+using Serilog;
+using System.Linq;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.GameState;
+using TaleWorlds.CampaignSystem.ViewModelCollection.WeaponCrafting.WeaponDesign;
+using TaleWorlds.CampaignSystem.ViewModelCollection.WeaponCrafting.WeaponDesign.Order;
+using TaleWorlds.Core;
+using TaleWorlds.Localization;
+
+namespace GameInterface.Services.Smithing.Patches;
+
+[HarmonyPatch(typeof(WeaponDesignVM))]
+internal class CraftingResultPatches
+{
+    private static readonly ILogger Logger = LogManager.GetLogger<WeaponDesignVM>();
+
+    [HarmonyPatch(nameof(WeaponDesignVM.ExecuteFinalizeCrafting))]
+    [HarmonyPrefix]
+    public static bool ExecuteFinalizeCraftingPrefix(ref WeaponDesignVM __instance)
+    {
+        // Call original if we call this function
+        if (CallOriginalPolicy.IsOriginalAllowed()) return true;
+
+        if (__instance._craftingBehavior != null && Campaign.Current.GameMode == CampaignGameMode.Campaign)
+        {
+            if (GameStateManager.Current.ActiveState is CraftingState)
+            {
+                if (IsFinalizingOrder(__instance))
+                {
+                    __instance.CraftedItemObject = null;
+                    __instance.CraftingOrderPopup.RefreshOrders();
+
+                    CraftingOrderItemVM craftingOrderItemVM = __instance.CraftingOrderPopup.CraftingOrders.FirstOrDefault(x => x.IsEnabled);
+                    if (craftingOrderItemVM != null)
+                    {
+                        __instance.CraftingOrderPopup.SelectOrder(craftingOrderItemVM);
+                    }
+                    else
+                    {
+                        __instance.IsInFinalCraftingStage = false;
+                        __instance.ExecuteOpenFreeBuildTab();
+                    }
+                }
+                else
+                {
+                    int bladeSize = __instance.BladeSize;
+                    int guardSize = __instance.GuardSize;
+                    int handleSize = __instance.HandleSize;
+                    int pommelSize = __instance.PommelSize;
+                    __instance.RefreshWeaponDesignMode(null, __instance._selectedWeaponClassIndex, false);
+                    __instance.BladeSize = bladeSize;
+                    __instance.GuardSize = guardSize;
+                    __instance.HandleSize = handleSize;
+                    __instance.PommelSize = pommelSize;
+                }
+            }
+            __instance.IsInFinalCraftingStage = false;
+        }
+        TextObject textObject = new TextObject("{=uZhHh7pm}Crafted {CURR_TEMPLATE_NAME}", null);
+        textObject.SetTextVariable("CURR_TEMPLATE_NAME", __instance._crafting.CurrentCraftingTemplate.TemplateName);
+        __instance._crafting.SetCraftedWeaponName(textObject);
+
+        // Replace original
+        return false;
+    }
+
+    internal static bool IsFinalizingOrder(WeaponDesignVM weaponDesignVM)
+    {
+        // Completing an order can switch the screen back to free-build mode before the popup is closed.
+        return weaponDesignVM?.CraftingResultPopup?.IsInOrderMode == true;
+    }
+}

@@ -1,0 +1,168 @@
+﻿using Common.Util;
+using E2E.Tests.Util;
+using GameInterface.Services.MapEvents;
+using HarmonyLib;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.MapEvents;
+using TaleWorlds.CampaignSystem.Party;
+using TaleWorlds.CampaignSystem.Settlements;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace E2E.Tests.Services.MapEvents;
+
+/// <summary>
+/// Verifies which map-event participant types allow the server's native campaign simulation to advance.
+/// </summary>
+public class MapEventUpdateAuthorityTests : MapEventTestBase
+{
+    public MapEventUpdateAuthorityTests(ITestOutputHelper output) : base(output) { }
+
+    [Fact]
+    public void AiOnlyMapEvent_WithSettlementParty_ServerUpdateIsAllowed()
+    {
+        var context = CreateServerMapEvent();
+        var settlementId = TestEnvironment.CreateRegisteredObject<Settlement>();
+
+        Server.Call(() =>
+        {
+            Assert.True(Server.ObjectManager.TryGetObject<MapEvent>(context.MapEventId, out var mapEvent));
+            Assert.True(Server.ObjectManager.TryGetObject<Settlement>(settlementId, out var settlement));
+
+            AddSyntheticMapEventParty(mapEvent.DefenderSide, settlement.Party);
+
+            Assert.True(InvokeMapEventUpdatePrefix(mapEvent));
+        }, MapEventDisabledMethods);
+    }
+
+    [Fact]
+    public void MapEvent_WithPlayerMobileParty_ServerUpdateIsBlocked()
+    {
+        var context = CreateServerMapEvent();
+        var (_, playerPartyId) = CreatePlayerHeroParty("player");
+
+        Server.Call(() =>
+        {
+            Assert.True(Server.ObjectManager.TryGetObject<MapEvent>(context.MapEventId, out var mapEvent));
+            Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(playerPartyId, out var playerParty));
+
+            AddSyntheticMapEventParty(mapEvent.AttackerSide, playerParty.Party);
+
+            Assert.False(InvokeMapEventUpdatePrefix(mapEvent));
+        }, MapEventDisabledMethods);
+    }
+
+    [Fact]
+    public void MissionAcceptedPlayerMapEvent_WithAllowedThread_ServerUpdateRemainsBlocked()
+    {
+        var context = CreateServerMapEvent();
+        var (_, playerPartyId) = CreatePlayerHeroParty("player");
+
+        try
+        {
+            Server.Call(() =>
+            {
+                Assert.True(Server.ObjectManager.TryGetObject<MapEvent>(context.MapEventId, out var mapEvent));
+                Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(playerPartyId, out var playerParty));
+
+                AddSyntheticMapEventParty(mapEvent.AttackerSide, playerParty.Party);
+                Assert.True(ServerBattleModeArbiter.TryClaimMission(context.MapEventId));
+
+                using (new AllowedThread())
+                    Assert.False(InvokeMapEventUpdatePrefix(mapEvent));
+            }, MapEventDisabledMethods);
+        }
+        finally
+        {
+            Server.Call(() => ServerBattleModeArbiter.Release(context.MapEventId));
+        }
+    }
+
+    [Fact]
+    public void MapEvent_WithMissingParty_ServerUpdateIsBlocked()
+    {
+        var context = CreateServerMapEvent();
+
+        Server.Call(() =>
+        {
+            Assert.True(Server.ObjectManager.TryGetObject<MapEvent>(context.MapEventId, out var mapEvent));
+
+            mapEvent.DefenderSide._battleParties.Add(ObjectHelper.SkipConstructor<MapEventParty>());
+
+            Assert.False(InvokeMapEventUpdatePrefix(mapEvent));
+        }, MapEventDisabledMethods);
+    }
+
+    [Fact]
+    public void MapEvent_WithStaleLeaderAndLockedAllocations_ServerUpdateRepairsSimulationSetup()
+    {
+        var context = CreateServerMapEvent();
+
+        Server.Call(() =>
+        {
+            Assert.True(Server.ObjectManager.TryGetObject<MapEvent>(context.MapEventId, out var mapEvent));
+            var side = mapEvent.AttackerSide;
+            var removedLeader = side.LeaderParty;
+            var expectedLeader = GameObjectCreator.CreateInitializedObject<MobileParty>().Party;
+            AddSyntheticMapEventParty(side, expectedLeader);
+
+            side._troopAllocationsLocked = true;
+            side._battleParties.RemoveAt(0);
+            removedLeader._mapEventSide = null;
+
+            Assert.True(InvokeMapEventUpdatePrefix(mapEvent));
+            Assert.Same(expectedLeader, side.LeaderParty);
+            Assert.False(side._troopAllocationsLocked);
+        }, MapEventDisabledMethods);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void MapEvent_WithEmptySideAndStaleFactionlessLeader_FinalizesAndReleasesReplicas(bool emptyAttacker)
+    {
+        var context = CreateServerMapEvent();
+        string remainingPartyId = emptyAttacker ? context.DefenderPartyId : context.AttackerPartyId;
+
+        Server.Call(() =>
+        {
+            Assert.True(Server.ObjectManager.TryGetObject<MapEvent>(context.MapEventId, out var mapEvent));
+            var emptySide = emptyAttacker ? mapEvent.AttackerSide : mapEvent.DefenderSide;
+            var removedParty = emptySide.LeaderParty;
+            emptySide._battleParties.Clear();
+            removedParty._mapEventSide = null;
+            emptySide.LeaderParty = ObjectHelper.SkipConstructor<PartyBase>();
+            Assert.Null(emptySide.LeaderParty.MapFaction);
+
+            mapEvent.Update();
+
+            Assert.Equal(MapEventState.WaitingRemoval, mapEvent.State);
+            Assert.Empty(mapEvent.InvolvedParties);
+            Assert.False(Server.ObjectManager.TryGetObject<MapEvent>(context.MapEventId, out _));
+            Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(remainingPartyId, out var remainingParty));
+            Assert.Null(remainingParty.MapEvent);
+        }, MapEventDisabledMethods);
+
+        foreach (var client in Clients)
+        {
+            Assert.False(client.ObjectManager.TryGetObject<MapEvent>(context.MapEventId, out _));
+            Assert.True(client.ObjectManager.TryGetObject<MobileParty>(remainingPartyId, out var remainingParty));
+            Assert.Null(remainingParty.MapEvent);
+        }
+    }
+
+    private static void AddSyntheticMapEventParty(MapEventSide side, PartyBase party)
+    {
+        party._mapEventSide = side;
+        side._battleParties.Add(new MapEventParty(party));
+    }
+
+    private static bool InvokeMapEventUpdatePrefix(MapEvent mapEvent)
+    {
+        var patchType = AccessTools.TypeByName("GameInterface.Services.MapEvents.Patches.MapEventPatches");
+        var prefix = AccessTools.Method(patchType, "PrefixUpdate");
+        Assert.NotNull(prefix);
+
+        return (bool)prefix.Invoke(null, new object[] { mapEvent })!;
+    }
+}

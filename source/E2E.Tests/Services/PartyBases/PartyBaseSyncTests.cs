@@ -1,0 +1,53 @@
+﻿using E2E.Tests.Util;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.Party;
+using TaleWorlds.CampaignSystem.Roster;
+using TaleWorlds.CampaignSystem.Settlements;
+using Xunit.Abstractions;
+
+namespace E2E.Tests.Services.PartyBases;
+
+public class PartyBaseSyncTests : SyncTestBase
+{
+    private string PartyBaseId;
+
+    public PartyBaseSyncTests(ITestOutputHelper output) : base(output)
+    {
+        PartyBaseId = TestEnvironment.CreateRegisteredObject<PartyBase>();
+        TestEnvironment.CreateRegisteredObject<MobileParty>();
+        TestEnvironment.CreateRegisteredObject<Settlement>();
+        TestEnvironment.CreateRegisteredObject<TroopRoster>();
+        TestEnvironment.CreateRegisteredObject<TroopRoster>();
+        TestEnvironment.CreateRegisteredObject<Hero>();
+    }
+
+    [Fact]
+    public void Server_PartyBase_PropertiesAndFields()
+    {
+        Server.ObjectManager.TryGetObject<PartyBase>(PartyBaseId, out var partyBase);
+        TestEnvironment.AssertReferenceProperty<PartyBase, MobileParty>(nameof(PartyBase.MobileParty));
+        // Managed ItemRosters synchronize by registry identity.
+        TestEnvironment.AssertProperty<PartyBase, ItemRoster>(nameof(PartyBase.ItemRoster), new ItemRoster(), defaultValue: partyBase.ItemRoster);
+        TestEnvironment.AssertReferenceProperty<PartyBase, TroopRoster>(nameof(PartyBase.MemberRoster));
+        TestEnvironment.AssertReferenceProperty<PartyBase, TroopRoster>(nameof(PartyBase.PrisonRoster));
+        TestEnvironment.AssertProperty<PartyBase, int>(nameof(PartyBase.RandomValue), 5, defaultValue: partyBase.RandomValue);
+        TestEnvironment.AssertReferenceProperty<PartyBase, Settlement>(nameof(PartyBase.Settlement));
+
+        // Not synced - cached/derived values (commented out in PartyBaseSync). Kept for future reference.
+        //TestEnvironment.AssertProperty<PartyBase, bool>(nameof(PartyBase.IsVisualDirty), true);
+        //TestEnvironment.AssertProperty<PartyBase, bool>(nameof(PartyBase.LevelMaskIsDirty), true);
+
+        // _index is set by a static counter in PartyBase and is not 0 by default
+        var initialIndex = partyBase._index;
+
+        TestEnvironment.AssertReferenceField<PartyBase, Hero>(nameof(PartyBase._customOwner));
+        TestEnvironment.AssertField<PartyBase, int>(nameof(PartyBase._index), 5, PartyBaseId, defaultValue: initialIndex);
+        TestEnvironment.AssertField<PartyBase, CampaignTime>(nameof(PartyBase._lastEatingTime), new CampaignTime(1512));
+        TestEnvironment.AssertField<PartyBase, int>(nameof(PartyBase._remainingFoodPercentage), 9);
+
+        // Not synced - cached/version-counter values (commented out in PartyBaseSync). Kept for future reference.
+        //TestEnvironment.AssertField<PartyBase, int>(nameof(PartyBase._lastNumberOfMenPerTierVersionNo), 6);
+        //TestEnvironment.AssertField<PartyBase, int>(nameof(PartyBase._lastNumberOfMenWithHorseVersionNo), 7);
+        //TestEnvironment.AssertField<PartyBase, int>(nameof(PartyBase._numberOfMenWithHorse), 8);
+    }
+}

@@ -1,0 +1,86 @@
+﻿// Ignore Spelling: Guids
+
+using Common.Messaging;
+using GameInterface.Services.Alleys;
+using GameInterface.Services.CampaignService.Data;
+using GameInterface.Services.Caravans;
+using GameInterface.Services.Clans;
+using System.Collections.Generic;
+using GameInterface.Services.Heroes;
+using GameInterface.Services.Inventory;
+using GameInterface.Services.Inventory.TradeSkills;
+using GameInterface.Services.MobileParties;
+using GameInterface.Services.ObjectManager;
+using GameInterface.Services.Smithing;
+using GameInterface.Services.Workshops;
+using ProtoBuf;
+
+namespace Coop.Core.Client.Messages;
+
+/// <summary>
+/// Received Game save data from the network event
+/// </summary>
+[ProtoContract(SkipConstructor = true)]
+public record NetworkGameSaveDataReceived : IEvent
+{
+    [ProtoMember(1)]
+    public byte[] GameSaveData { get; }
+    [ProtoMember(2)]
+    public string CampaignID { get; }
+    [ProtoMember(3)]
+    public CraftingPlayerData CraftingPlayerData { get; }
+    [ProtoMember(4)]
+    public WorkshopPlayerData WorkshopPlayerData { get; }
+    [ProtoMember(5)]
+    public CaravansPlayerData CaravansPlayerData { get; }
+    [ProtoMember(6)]
+    public AlleyPlayerData AlleyPlayerData { get; }
+    [ProtoMember(7)]
+    public InteractionsPlayerData InteractionsPlayerData { get; }
+    [ProtoMember(8)]
+    public TradePlayerData TradePlayerData { get; }
+    [ProtoMember(9)]
+    public InventoryPlayerData InventoryPlayerData { get; }
+    [ProtoMember(10)]
+    public HeroMeetingData HeroMeetingData { get; }
+    [ProtoMember(11)]
+    public AgingPlayerData AgingPlayerData { get; }
+    [ProtoMember(12)]
+    public AttachmentIdMap AttachmentIdMap { get; }
+    [ProtoMember(13)]
+    public ServerOptions ServerOptions { get; }
+    [ProtoMember(14)]
+    public Dictionary<string, ClanFinanceSettings> ClanFinance { get; }
+
+    public NetworkGameSaveDataReceived(
+        byte[] gameSaveData,
+        string campaignID,
+        CraftingPlayerData craftingPlayerData,
+        WorkshopPlayerData workshopPlayerData,
+        CaravansPlayerData caravansPlayerData,
+        AlleyPlayerData alleyPlayerData,
+        InteractionsPlayerData interactionsPlayerData,
+        TradePlayerData tradePlayerData,
+        InventoryPlayerData inventoryPlayerData,
+        HeroMeetingData heroMeetingData,
+        AgingPlayerData agingPlayerData,
+        AttachmentIdMap attachmentIdMap,
+        ServerOptions serverOptions,
+        Dictionary<string, ClanFinanceSettings> clanFinance = null)
+    {
+        GameSaveData = gameSaveData;
+        CampaignID = campaignID;
+        CraftingPlayerData = craftingPlayerData;
+        WorkshopPlayerData = workshopPlayerData;
+        CaravansPlayerData = caravansPlayerData;
+        AlleyPlayerData = alleyPlayerData;
+        InteractionsPlayerData = interactionsPlayerData;
+        TradePlayerData = tradePlayerData;
+        InventoryPlayerData = inventoryPlayerData;
+        HeroMeetingData = heroMeetingData;
+        AgingPlayerData = agingPlayerData;
+        AttachmentIdMap = attachmentIdMap;
+        ServerOptions = serverOptions;
+        ClanFinance = clanFinance;
+    }
+}

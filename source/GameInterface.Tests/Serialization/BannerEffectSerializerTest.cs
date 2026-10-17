@@ -1,0 +1,43 @@
+﻿using Autofac;
+using Common.Serialization;
+using GameInterface.Serialization;
+using GameInterface.Serialization.External;
+using GameInterface.Tests.Bootstrap.Modules;
+using System.Runtime.Serialization;
+using TaleWorlds.Core;
+using Xunit;
+
+namespace GameInterface.Tests.Serialization.SerializerTests
+{
+    public class BannerEffectSerializationTest
+    {
+        ILifetimeScope container;
+        public BannerEffectSerializationTest()
+        {
+            container = SerializationTestContainer.BeginScope();
+        }
+
+        [Fact]
+        public void BannerEffect_Full_Serialization()
+        {
+            BannerEffect testBannerEffect = (BannerEffect)FormatterServices.GetUninitializedObject(typeof(BannerEffect));
+
+            var factory = container.Resolve<IBinaryPackageFactory>();
+            BannerEffectBinaryPackage package = new BannerEffectBinaryPackage(testBannerEffect, factory);
+
+            package.Pack();
+
+            byte[] bytes = BinaryPackageSerializer.Serialize(package);
+
+            Assert.NotEmpty(bytes);
+
+            object obj = BinaryPackageSerializer.Deserialize(bytes);
+
+            Assert.IsType<BannerEffectBinaryPackage>(obj);
+
+            BannerEffectBinaryPackage returnedPackage = (BannerEffectBinaryPackage)obj;
+
+            Assert.Equal(returnedPackage.stringId, package.stringId);
+        }
+    }
+}

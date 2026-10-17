@@ -1,0 +1,550 @@
+﻿using Common;
+using Common.Logging;
+using Common.Messaging;
+using GameInterface.Services.MapEvents.Messages;
+using GameInterface.Services.MapEvents.TroopSupply;
+using GameInterface.Services.ObjectManager;
+using Missions.Agents.Packets;
+using Missions.Data;
+using Missions.Messages;
+using Serilog;
+using System;
+using System.Collections.Generic;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.MapEvents;
+using TaleWorlds.CampaignSystem.Party;
+using TaleWorlds.Core;
+using TaleWorlds.MountAndBlade;
+
+namespace Missions.Battles;
+
+/// <summary>
+/// Owner-side spawn replication for a coop battle. Each client spawns only the troops it owns — its own
+/// party, plus the AI/enemy side on the host — and this component captures each of those spawns
+/// (<see cref="AgentSpawnedInBattle"/>, published by <c>BattleAgentSpawnedPatch</c>), registers the agent
+/// under the local controller and replicates it over the mesh so peers spawn a matching puppet driven by our
+/// movement. It also replays everything we own to a joiner catching up, and broadcasts our own-party troops
+/// at their deployed positions on the deployment commit (requirement #4, "hidden everywhere until deployed").
+/// </summary>
+public interface IOwnedAgentReplicator : IDisposable
+{
+    /// <summary>
+    /// Replay the battle agents WE own to a peer that just joined, so it spawns matching puppets driven by our
+    /// movement. The per-spawn broadcasts only reached peers already connected when each agent spawned, so a
+    /// player entering after troops are on the field — including a mid-battle joiner — would otherwise miss
+    /// them. Each client replays the agents IT owns, so the joiner is caught up from every owner (its own
+    /// troops it spawns natively).
+    /// </summary>
+    void ReplicateCurrentAgentsTo(string controllerId);
+    void RecoverRetainedPlayerHandoffs(float dt);
+
+    /// <summary>[Owner, game thread] Send newly captured agents as bounded batches once per mission tick.</summary>
+    void FlushPendingSpawns();
+    void FlushPendingFormations();
+
+    /// <summary>
+    /// [Owner, game thread] Replicate our own-party troops at their DEPLOYED positions so peers spawn matching
+    /// puppets where we placed them. Called on the FIRST deployment commit — until then these were withheld
+    /// (requirement #4: hidden everywhere until deployed). Must run synchronously on the commit's game-thread
+    /// call, before the native un-pause moves the troops, so the captured positions are the deployed ones.
+    /// </summary>
+    void BroadcastOwnDeployedTroops();
+
+    /// <summary>[Game thread] Refresh owned riders affected by an authority change, including their horses.</summary>
+    void BroadcastAuthorityRefresh(IReadOnlyCollection<Guid> changedAgentIds);
+}
+
+/// <inheritdoc cref="IOwnedAgentReplicator"/>
+public class OwnedAgentReplicator : IOwnedAgentReplicator
+{
+    private static readonly ILogger Logger = LogManager.GetLogger<OwnedAgentReplicator>();
+
+    private readonly IBattleNetwork network;
+    private readonly IMessageBroker messageBroker;
+    private readonly IObjectManager objectManager;
+    private readonly ICoopMissionComponent coopMissionComponent;
+    private readonly IBattleSession session;
+    private readonly ICasualtyAttributionMap casualties;
+    private readonly IBattleDeploymentCoordinator deployment;
+    private readonly IBattleAgentSpawnBatchCodec spawnBatchCodec;
+    private readonly IMissionWeaponDataMapper missionWeaponDataMapper;
+    private readonly IBattleAuthorityMigrator authorityMigrator;
+    private float retainedHeroRecoverySeconds;
+    private readonly List<BattleAgentSpawnData> pendingSpawns = new List<BattleAgentSpawnData>();
+    private readonly HashSet<Agent> pendingFormations = new HashSet<Agent>();
+
+    // The horse each of our riders SPAWNED with (rider id → mount id), so a record built while the rider is
+    // momentarily dismounted still carries the horse's identity — a joiner's puppet spawns a horse from the
+    // rider's equipment either way, and must map it to the id the rest of the battle already routes by, or
+    // that horse's death broadcast never reaches the joiner. Touched only on the game thread (spawn capture
+    // and record building both run there), so no lock; per-mission (this component is transient).
+    private readonly Dictionary<Guid, Guid> spawnMounts = new Dictionary<Guid, Guid>();
+    private readonly string movementScopeId;
+    private ushort nextMovementId = 1;
+
+    public OwnedAgentReplicator(
+        IBattleNetwork network,
+        IMessageBroker messageBroker,
+        IObjectManager objectManager,
+        ICoopMissionComponent coopMissionComponent,
+        IBattleSession session,
+        ICasualtyAttributionMap casualties,
+        IBattleDeploymentCoordinator deployment,
+        IBattleAgentSpawnBatchCodec spawnBatchCodec,
+        IMissionWeaponDataMapper missionWeaponDataMapper,
+        IBattleAuthorityMigrator authorityMigrator = null)
+    {
+        this.authorityMigrator = authorityMigrator;
+        this.network = network;
+        this.messageBroker = messageBroker;
+        this.objectManager = objectManager;
+        this.coopMissionComponent = coopMissionComponent;
+        this.session = session;
+        this.casualties = casualties;
+        this.deployment = deployment;
+        this.spawnBatchCodec = spawnBatchCodec;
+        this.missionWeaponDataMapper = missionWeaponDataMapper;
+        movementScopeId =
+            session.OwnControllerId + ":" + Guid.NewGuid().ToString("N");
+
+        messageBroker.Subscribe<AgentSpawnedInBattle>(Handle_AgentSpawnedInBattle);
+        messageBroker.Subscribe<BattleAgentFormationChanged>(Handle_FormationChanged);
+    }
+
+    public void Dispose()
+    {
+        messageBroker.Unsubscribe<AgentSpawnedInBattle>(Handle_AgentSpawnedInBattle);
+        messageBroker.Unsubscribe<BattleAgentFormationChanged>(Handle_FormationChanged);
+        pendingSpawns.Clear();
+        pendingFormations.Clear();
+    }
+
+    private void Handle_FormationChanged(MessagePayload<BattleAgentFormationChanged> payload)
+    {
+        var agent = payload.What.Agent;
+        if (coopMissionComponent.AgentRegistry.TryGetAgentInfo(agent, out var info)
+            && info.CurrentAuthority == session.OwnControllerId)
+            pendingFormations.Add(agent);
+    }
+
+    public void FlushPendingFormations()
+    {
+        if (pendingFormations.Count == 0) return;
+
+        var updates = new List<BattleAgentFormationData>();
+        foreach (var agent in pendingFormations)
+        {
+            if (!coopMissionComponent.AgentRegistry.TryGetAgentInfo(agent, out var info)
+                || info.CurrentAuthority != session.OwnControllerId || !agent.IsActive()
+                || agent.IsMount || !(agent.Character is CharacterObject character)
+                || deployment.ShouldWithhold(IsOwnPartyAgent(agent, character))) continue;
+
+            updates.Add(new BattleAgentFormationData(info.AgentId,
+                agent.Formation == null ? -1 : (int)agent.Formation.FormationIndex, info.AuthorityRevision));
+            if (updates.Count == NetworkBattleAgentFormations.MaxUpdates)
+            {
+                network.SendAll(new NetworkBattleAgentFormations(session.InstanceId, session.OwnControllerId, updates.ToArray()));
+                updates.Clear();
+            }
+        }
+        pendingFormations.Clear();
+        if (updates.Count > 0)
+            network.SendAll(new NetworkBattleAgentFormations(session.InstanceId, session.OwnControllerId, updates.ToArray()));
+    }
+
+    // Reading agent transforms must run on the game thread. SendJoinInfo supplies the blocking barrier when an
+    // already-active battle needs one; pre-activation mission loading must remain non-blocking.
+    public void ReplicateCurrentAgentsTo(string controllerId)
+    {
+        GameThread.RunSafe(() =>
+        {
+            if (Mission.Current == null) return;
+
+            // A joiner catches up on everything we own (our own party AND, on the host, the AI it drives).
+            authorityMigrator?.ReplayPlayerHandoff(controllerId);
+            var records = BuildOwnedAgentRecords(ownPartyOnly: false);
+            records.RemoveAll(data => authorityMigrator?.TrySurrenderPlayerHero(controllerId, data) == true);
+            if (records.Count == 0) return;
+
+            IReadOnlyList<NetworkSpawnBattleAgents> batches =
+                spawnBatchCodec.Encode(records, SpawnBatchPurpose.CatchUp);
+            foreach (NetworkSpawnBattleAgents batch in batches)
+                network.Send(controllerId, batch);
+
+            LogBatchSend("Replayed", records.Count, batches, controllerId);
+        }, context: nameof(ReplicateCurrentAgentsTo));
+    }
+
+    // A successor reconstructs the surrendered hero request even when the returner already joined.
+    public void RecoverRetainedPlayerHandoffs(float dt)
+    {
+        if (!session.IsLocalHost || authorityMigrator == null || Mission.Current == null) return;
+        retainedHeroRecoverySeconds += dt;
+        if (retainedHeroRecoverySeconds < 0.5f) return;
+        retainedHeroRecoverySeconds = 0;
+        foreach (var data in BuildOwnedAgentRecords(ownPartyOnly: false, retainedPlayerHeroesOnly: true))
+            authorityMigrator.TrySurrenderPlayerHero(data);
+    }
+
+    public void FlushPendingSpawns()
+    {
+        if (pendingSpawns.Count == 0) return;
+
+        IReadOnlyList<NetworkSpawnBattleAgents> batches =
+            spawnBatchCodec.Encode(pendingSpawns, SpawnBatchPurpose.Initial);
+        int recordCount = pendingSpawns.Count;
+        pendingSpawns.Clear();
+
+        foreach (NetworkSpawnBattleAgents batch in batches)
+            network.SendAll(batch);
+
+        LogBatchSend("Broadcast", recordCount, batches, null);
+    }
+
+    public void BroadcastOwnDeployedTroops()
+    {
+        if (Mission.Current == null) return;
+
+        // Initial NPC/reinforcement records captured earlier this frame must also be ahead of the deployment
+        // marker. All of these sends use ReliableOrdered, so the receiver observes the same barrier.
+        FlushPendingSpawns();
+
+        var records = BuildOwnedAgentRecords(ownPartyOnly: true);
+        if (records.Count == 0) return;
+
+        IReadOnlyList<NetworkSpawnBattleAgents> batches =
+            spawnBatchCodec.Encode(records, SpawnBatchPurpose.Deployment);
+        foreach (NetworkSpawnBattleAgents batch in batches)
+            network.SendAll(batch);
+
+        LogBatchSend("Committed deployment", records.Count, batches, null);
+    }
+
+    public void BroadcastAuthorityRefresh(IReadOnlyCollection<Guid> changedAgentIds)
+    {
+        if (Mission.Current == null || changedAgentIds.Count == 0) return;
+        var changedIds = new HashSet<Guid>(changedAgentIds);
+        var records = BuildOwnedAgentRecords(ownPartyOnly: false);
+        records.RemoveAll(record => !changedIds.Contains(record.AgentId) && !changedIds.Contains(record.MountAgentId));
+        if (records.Count == 0) return;
+
+        var batches = spawnBatchCodec.Encode(records, SpawnBatchPurpose.CatchUp);
+        foreach (var batch in batches)
+            network.SendAll(batch);
+        LogBatchSend("Refreshed authority for", records.Count, batches, null);
+    }
+
+    // [Game thread] Build spawn records for the battle agents WE currently own, at their CURRENT positions.
+    // <paramref name="ownPartyOnly"/> limits it to the local player's own-party troops — used by the deployment
+    // commit, which withholds those until they are placed; the joiner catch-up passes false to replay all we own.
+    // Registered MOUNTS get no record of their own — a horse spawns implicitly with its rider on the receiver,
+    // so its id rides on the rider's record instead (MountAgentId).
+    private List<BattleAgentSpawnData> BuildOwnedAgentRecords(bool ownPartyOnly, bool retainedPlayerHeroesOnly = false)
+    {
+        var records = new List<BattleAgentSpawnData>();
+        foreach (var info in coopMissionComponent.AgentRegistry.GetAgents(session.OwnControllerId))
+        {
+            var agent = info.Agent;
+            if (agent == null || !agent.IsActive() || agent.IsMount || !(agent.Character is CharacterObject character)) continue;
+
+            if (retainedPlayerHeroesOnly && !character.IsHero) continue;
+
+            bool isOwnParty = IsOwnPartyAgent(agent, character);
+            if (ownPartyOnly && !isOwnParty) continue;
+            // Consistent with the per-spawn withhold: don't replay own-party while our deployment is uncommitted,
+            // or a joiner catch-up spawns them at their pre-arrangement formation and dedupes the commit broadcast
+            // that carries the real one. They arrive via that commit broadcast (or a post-commit catch-up) instead.
+            if (deployment.ShouldWithhold(isOwnParty)) continue;
+
+            // Carried by CharacterObject id, uniform for heroes and troops (hero CharacterObjects are registered).
+            if (!objectManager.TryGetId(character, out var characterId)) continue;
+
+            var attribution = casualties.GetOrDefault(info.AgentId);
+            var side = agent.Team != null ? agent.Team.Side : BattleSideEnum.None;
+            int formationIndex = agent.Formation != null ? (int)agent.Formation.FormationIndex : -1;
+
+            var spawnEquipment = agent.SpawnEquipment;
+            var bodyProperties = agent.BodyPropertiesValue;
+            var missionEquipmentData = PackMissionEquipmentData(agent.Equipment);
+
+            // Catch-up records carry the current holder. A migrated NPC must stay under the successor when its
+            // original host rejoins; labeling it with the original host would make that client drive it too.
+            Guid mountAgentId = ResolveMountIdFor(info.AgentId, agent);
+            CoopAgentInfo mountInfo = ResolveAgentInfo(mountAgentId);
+
+            records.Add(new BattleAgentSpawnData(
+                info.AgentId, characterId, agent.Position, side, agent.Health,
+                session.OwnControllerId, attribution.MapEventPartyId, attribution.TroopSeed,
+                spawnEquipment, bodyProperties, missionEquipmentData,
+                mountAgentId, formationIndex, info.MovementId,
+                mountInfo?.MovementId ?? 0,
+                originalOwnerControllerId: info.OriginalOwner,
+                currentEquipment: new AgentEquipmentData(agent),
+                movementScopeId: info.MovementScopeId,
+                mountOriginalOwnerControllerId:
+                    mountInfo?.OriginalOwner ?? info.OriginalOwner,
+                mountMovementScopeId:
+                    mountInfo?.MovementScopeId ?? info.MovementScopeId,
+                isRunningAway: agent.IsRunningAway,
+                authorityRevision: info.AuthorityRevision,
+                mountAuthorityRevision: mountInfo?.AuthorityRevision ?? 0,
+                mountOwnerControllerId: mountInfo?.CurrentAuthority ?? info.CurrentAuthority,
+                siegeEquipmentGrant: agent.Equipment[EquipmentIndex.ExtraWeaponSlot].IsEmpty
+                    ? Guid.Empty : info.SiegeEquipmentGrant,
+                siegeEquipmentGrantRevision: info.SiegeEquipmentGrantRevision));
+        }
+        return records;
+    }
+
+    // The registry id of the agent's current mount, or Guid.Empty when on foot / the horse isn't registered
+    // (then the receiver's puppet horse simply stays unregistered and hits on it fall back to rider-keyed routing).
+    private Guid GetRegisteredMountId(Agent agent)
+    {
+        var mount = agent.MountAgent;
+        if (mount != null && coopMissionComponent.AgentRegistry.TryGetAgentInfo(mount, out var mountInfo))
+            return mountInfo.AgentId;
+        return Guid.Empty;
+    }
+
+    // The mount id carried on a rider's record: its CURRENT horse when mounted, else the horse it spawned
+    // with — as long as that one is still registered, alive and riderless (a horse someone else took rides
+    // on THAT rider's record instead). Without the fallback, a rider that happens to be dismounted at
+    // record-build time would strand the joiner's implicitly-spawned horse without the battle's id for it.
+    private Guid ResolveMountIdFor(Guid riderId, Agent rider)
+    {
+        var current = GetRegisteredMountId(rider);
+        if (current != Guid.Empty) return current;
+
+        if (spawnMounts.TryGetValue(riderId, out var spawnMountId)
+            && coopMissionComponent.AgentRegistry.TryGetAgentInfo(spawnMountId, out var mountInfo)
+            && mountInfo.Agent is Agent horse && horse.IsActive() && horse.RiderAgent == null)
+            return spawnMountId;
+
+        return Guid.Empty;
+    }
+
+    private CoopAgentInfo ResolveAgentInfo(Guid agentId)
+    {
+        return agentId != Guid.Empty &&
+               coopMissionComponent.AgentRegistry.TryGetAgentInfo(agentId, out var info)
+            ? info
+            : null;
+    }
+
+    // Whether an agent belongs to the LOCAL player's own party — the troops withheld until deployment commit
+    // (requirement #4). The player's hero and the troops the local supplier spawned for MainParty are own-party;
+    // the host's enemy/allied AI (a different origin party) is not, so it shows up frozen during deployment (#1).
+    internal static bool IsOwnPartyAgent(Agent agent, CharacterObject character)
+    {
+        if (character.IsHero && character.HeroObject == Hero.MainHero) return true;
+        return agent.Origin is CoopAgentOrigin origin && origin.Party == PartyBase.MainParty;
+    }
+
+    // [Owner] An agent WE spawned into the battle was captured (BattleAgentSpawnedPatch). Each client spawns
+    // only the troops it owns — its own party, plus the AI/enemy side on the host — so we are this agent's
+    // owner: give it a network id, register it under us, and replicate it so peers spawn a matching puppet
+    // driven by our movement. Our own hero is already the native main agent, so no adoption is needed here.
+    private void Handle_AgentSpawnedInBattle(MessagePayload<AgentSpawnedInBattle> payload)
+    {
+        var agent = payload.What.Agent;
+        if (agent == null || !(agent.Character is CharacterObject character)) return;
+
+        AttachPlayerAgent(agent, character);
+
+        // Carried by CharacterObject id, uniform for heroes and troops (hero CharacterObjects are registered).
+        if (!objectManager.TryGetId(character, out var characterId)) return;
+
+        string owner = session.OwnControllerId;
+        var agentId = Guid.NewGuid();
+        ushort movementId = AllocateMovementId();
+        if (!coopMissionComponent.AgentRegistry.TryRegisterAgent(
+                owner,
+                owner,
+                movementScopeId,
+                agentId,
+                movementId,
+                agent))
+            return;
+
+        // A cavalry spawn's horse is already live and linked here (the engine spawns it inside the same
+        // Mission.SpawnAgent call, from the rider's equipment). Register it with its OWN identity under us, so
+        // hits on it route by the horse's id and its death broadcasts like any agent's (issue #1750). Mounts
+        // get no casualty attribution — a horse is not a roster troop.
+        var mountAgentId = Guid.Empty;
+        ushort mountMovementId = 0;
+        if (agent.MountAgent is Agent mount)
+        {
+            mountAgentId = Guid.NewGuid();
+            mountMovementId = AllocateMovementId();
+            if (!coopMissionComponent.AgentRegistry.TryRegisterAgent(
+                    owner,
+                    owner,
+                    movementScopeId,
+                    mountAgentId,
+                    mountMovementId,
+                    mount))
+            {
+                mountAgentId = Guid.Empty;
+                mountMovementId = 0;
+            }
+            else
+                spawnMounts[agentId] = mountAgentId;
+        }
+
+        // Casualty attribution: the battle-troop origin carries the map-event party and the exact troop
+        // descriptor seed the server's OnTroopKilled path keys on. Carry them so we can report the casualty
+        // on death (puppets, spawned with a SimpleAgentOrigin, get these from the spawn data).
+        string mapEventPartyId = null;
+        int troopSeed = 0;
+        bool isDebugReplicationFixture = agent.Origin is DebugReplicationFixtureAgentOrigin;
+        // Our coop spawns carry a CoopAgentOrigin (the custom supplier's origin), NOT the native
+        // PartyGroupAgentOrigin — read the party + descriptor seed from it. Checking for the native type here
+        // left attribution null, so the death report was skipped and the map-event roster never decremented.
+        if (agent.Origin is CoopAgentOrigin origin)
+        {
+            troopSeed = origin.UniqueSeed;
+
+            if (!isDebugReplicationFixture)
+            {
+                // The origin carries the server's MapEventParty id directly; re-deriving it from the local
+                // map-event membership missed whole parties (a garrison whose wrapper never resolved here),
+                // and an unattributed spawn record is never spawned as a puppet on the other clients.
+                mapEventPartyId = origin.MapEventPartyId;
+                if (mapEventPartyId == null && origin.Party != null)
+                {
+                    var mapEventParty = ResolveMapEventParty(origin.Party);
+                    if (mapEventParty != null && objectManager.TryGetId(mapEventParty, out var mepId))
+                        mapEventPartyId = mepId;
+                }
+            }
+        }
+        // The casualty keys on the troop's CHARACTER — exactly `characterId`, the CharacterObject's object-manager
+        // id we also carry in the spawn data.
+        casualties.Record(agentId, mapEventPartyId, troopSeed, characterId);
+
+        var spawnEquipment = agent.SpawnEquipment;
+        var bodyProperties = agent.BodyPropertiesValue;
+        var missionEquipmentData = PackMissionEquipmentData(agent.Equipment);
+
+        BattleSideEnum side = agent.Team != null ? agent.Team.Side : BattleSideEnum.None;
+        int formationIndex = agent.Formation != null ? (int)agent.Formation.FormationIndex : -1;
+        var data = new BattleAgentSpawnData(
+            agentId, characterId, agent.Position, side, agent.Health, owner,
+            mapEventPartyId, troopSeed, spawnEquipment, bodyProperties,
+            missionEquipmentData, mountAgentId, formationIndex, movementId,
+            mountMovementId,
+            originalOwnerControllerId: owner,
+            currentEquipment: new AgentEquipmentData(agent),
+            movementScopeId: movementScopeId,
+            mountOriginalOwnerControllerId: owner,
+            mountMovementScopeId: movementScopeId,
+            isRunningAway: agent.IsRunningAway);
+
+        // Populate MapEvent's UpgradeTroopTracker with spawned agent to handle on the server during battle.
+        if (!isDebugReplicationFixture)
+        messageBroker.Publish(this, new TrackTroopForUpgrades(mapEventPartyId, characterId));
+
+        // Requirement #4 "hidden everywhere until deployed": while we are still placing our own formations our
+        // own-party troops are spawned locally (so we can deploy them) but NOT replicated, so other clients never
+        // see them mid-deployment. They are broadcast at their deployed positions when we commit (see
+        // BroadcastOwnDeployedTroops). NPC/AI agents WE own (the host's enemy side) are not withheld —
+        // they must show up frozen on every client during deployment (requirement #1).
+        if (deployment.ShouldWithhold(IsOwnPartyAgent(agent, character)))
+        {
+            Logger.Information("[BattleSync] Withholding own spawn {Char} (agent {AgentId}) until deployment commit", characterId, agentId);
+            return;
+        }
+
+        // Coalesce captures from native's spawn loop. The next mission tick emits bounded compressed batches
+        // instead of hundreds of singleton reliable messages.
+        pendingSpawns.Add(data);
+        Logger.Debug("[BattleSync] Captured own spawn {Char} (agent {AgentId}); queued for batched replication", characterId, agentId);
+    }
+
+    private static void LogBatchSend(
+        string action,
+        int recordCount,
+        IReadOnlyList<NetworkSpawnBattleAgents> batches,
+        string controllerId)
+    {
+        int wireBytes = 0;
+        int uncompressedBytes = 0;
+        foreach (NetworkSpawnBattleAgents batch in batches)
+        {
+            wireBytes += batch.Payload?.Length ?? 0;
+            uncompressedBytes += batch.UncompressedLength;
+        }
+
+        Logger.Information(
+            "[BattleTraffic] {Action} spawn transfer {TransferId}: {RecordCount} record(s) in {BatchCount} batch(es), " +
+            "{WireBytes} wire bytes from {UncompressedBytes} protobuf bytes{Controller}",
+            action,
+            batches.Count == 0 ? Guid.Empty : batches[0].TransferId,
+            recordCount,
+            batches.Count,
+            wireBytes,
+            uncompressedBytes,
+            controllerId == null ? string.Empty : $" to {controllerId}");
+    }
+
+    private ushort AllocateMovementId()
+    {
+        ushort movementId = nextMovementId++;
+        if (movementId == 0)
+            throw new InvalidOperationException("A mission controller exhausted its compact movement ids.");
+        return movementId;
+    }
+
+    private static void AttachPlayerAgent(Agent agent, CharacterObject character)
+    {
+        // While a deployment phase is live, the deployment controller owns the player agent — it holds our hero
+        // as Controller.None until Start Battle and assigns Mission.MainAgent itself on FinishDeployment (via
+        // AssignPlayerRoleInTeamMissionController). Forcing Player control here would fight that freeze, so defer
+        // to native deployment; this attach only matters post-deployment (e.g. adopting our own hero puppet).
+        if (Mission.Current?.GetMissionBehavior<DeploymentMissionController>() != null)
+            return;
+
+        // Our own hero just spawned: take control of it ourselves — set it as the mission's controllable main
+        // agent (the camera follows the main agent). Done before the resolution/registration below so it runs
+        // even if those fail.
+        if (character.IsHero && character.HeroObject == Hero.MainHero && Mission.Current != null && Mission.Current.MainAgent != agent)
+        {
+            agent.Controller = AgentControllerType.Player;
+            Mission.Current.MainAgent = agent;
+            Logger.Information("[BattleSync] Attached player to own hero agent ({Char})", character.StringId);
+        }
+    }
+
+    // The MapEventParty wrapping the given battle party — the casualty target on the server.
+    private static MapEventParty ResolveMapEventParty(PartyBase party)
+    {
+        var side = party?.MapEventSide;
+        if (side == null) return null;
+
+        foreach (var mapEventParty in side.Parties)
+        {
+            if (mapEventParty?.Party == party)
+                return mapEventParty;
+        }
+        return null;
+    }
+
+    private MissionEquipmentData PackMissionEquipmentData(MissionEquipment equipment)
+    {
+        var missionEquipmentData = new MissionEquipmentData(new());
+        if (equipment == null) return null;
+
+        for (EquipmentIndex equipmentIndex = EquipmentIndex.WeaponItemBeginSlot; equipmentIndex < EquipmentIndex.NumAllWeaponSlots; equipmentIndex++)
+        {
+            if (!missionWeaponDataMapper.TryPack(
+                    equipment._weaponSlots[(int)equipmentIndex],
+                    out MissionWeaponData packedWeapon))
+            {
+                return null;
+            }
+
+            missionEquipmentData.WeaponSlots.Add(packedWeapon);
+        }
+        return missionEquipmentData;
+    }
+}

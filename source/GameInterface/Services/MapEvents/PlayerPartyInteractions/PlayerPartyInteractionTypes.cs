@@ -1,0 +1,112 @@
+﻿namespace GameInterface.Services.MapEvents.PlayerPartyInteractions;
+
+public enum PlayerPartyInteractionPhase
+{
+    None,
+    InitialOptions,
+    OfferServices,
+    WaitingForProposal,
+    WaitingForResponse,
+    ProposalPending,
+    TradeActive,
+    HostileDemandConfirm,
+    HostileDemandPending,
+    MercenaryConfirm,
+    MarriageOptions
+}
+
+public enum PlayerPartyInteractionOption
+{
+    None,
+    TradeProposal,
+    OfferServices,
+    JoinClan,
+    Vassal,
+    Mercenary,
+    ConfirmMercenary,
+    CancelMercenary,
+    AcceptProposal,
+    DeclineProposal,
+    Leave,
+    HostileDemand,
+    ConfirmHostileDemand,
+    CancelHostileDemand,
+    RefuseHostileDemand,
+    YieldHostileDemand,
+    LeaveClan,
+    RemoveFromClan,
+    ProposeMarriage,
+    PatrilinealMarriage,
+    MatrilinealMarriage,
+    CancelMarriage,
+    RequestMapTracking,
+    StopMapTracking
+}
+
+public enum PlayerPartyInteractionVassalUnavailableReason
+{
+    None,
+    TargetIsNotKingdomLeader,
+    InitiatorHasNoClan,
+    InitiatorIsInKingdom,
+    InitiatorClanTierTooLow
+}
+
+public enum PlayerPartyInteractionMercenaryUnavailableReason
+{
+    None,
+    InitiatorHasNoClan,
+    InitiatorIsNotClanLeader,
+    InitiatorClanTierTooLow,
+    AlreadyMercenaryForThisKingdom,
+    InitiatorClanHasSettlement,
+    NotEnoughRelation,
+    ClanIsInKingdom,
+    TargetHasNoKingdom,
+    IsAtWarWithTarget,
+    IncompatibleWars
+}
+public enum PlayerPartyInteractionProposal
+{
+    None,
+    Trade,
+    JoinClan,
+    Vassal,
+    Mercenary,
+    HostileDemand,
+    PatrilinealMarriage,
+    MatrilinealMarriage,
+    MapTracking
+}
+
+public enum PlayerPartyInteractionOutcomeType
+{
+    None,
+    Left,
+    TradeAccepted,
+    TradeDeclined,
+    ClanJoinAccepted,
+    ClanJoinDeclined,
+    VassalAccepted,
+    VassalDeclined,
+    MercenaryAccepted,
+    MercenaryDeclined,
+    Rejected,
+    Disconnected,
+    HostileDemandAccepted,
+    HostileDemandYielded,
+    ClanLeft,
+    ClanMemberRemoved,
+    MarriageAccepted,
+    MarriageDeclined,
+    MapTrackingAccepted,
+    MapTrackingDeclined,
+    MapTrackingStopped
+}
+
+public enum PlayerPartyInteractionDeniedReason
+{
+    None,
+    Busy,
+    Hostile
+}

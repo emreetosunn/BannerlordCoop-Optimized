@@ -1,0 +1,24 @@
+﻿using Common.Messaging;
+using ProtoBuf;
+
+namespace GameInterface.Services.MapEvents.Messages.Leave;
+
+// [Client -> Server] Remove this party from its map event side, leaving the battle running.
+[ProtoContract(SkipConstructor = true)]
+internal readonly struct NetworkRequestLeaveBattle : ICommand
+{
+    [ProtoMember(1)]
+    public readonly string PartyId;
+    [ProtoMember(2)]
+    public readonly bool FinishLocalMenus;
+
+    [ProtoMember(3)]
+    public readonly bool BreakSiege;
+
+    public NetworkRequestLeaveBattle(string partyId, bool finishLocalMenus = true, bool breakSiege = false)
+    {
+        PartyId = partyId;
+        FinishLocalMenus = finishLocalMenus;
+        BreakSiege = breakSiege;
+    }
+}

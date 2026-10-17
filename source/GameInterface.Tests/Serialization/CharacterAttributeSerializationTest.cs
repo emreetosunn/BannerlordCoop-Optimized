@@ -1,0 +1,67 @@
+﻿using Autofac;
+using Common.Serialization;
+using GameInterface.Serialization;
+using GameInterface.Serialization.External;
+using GameInterface.Services.ObjectManager;
+using GameInterface.Tests.Bootstrap;
+using GameInterface.Tests.Bootstrap.Modules;
+using TaleWorlds.Core;
+using Xunit;
+
+namespace GameInterface.Tests.Serialization.SerializerTests
+{
+    public class CharacterAttributeSerializationTest
+    {
+        ILifetimeScope container;
+        public CharacterAttributeSerializationTest()
+        {
+            GameBootStrap.Initialize();
+
+            container = SerializationTestContainer.BeginScope();
+        }
+
+        [Fact]
+        public void CharacterAttribute_Serialize()
+        {
+            CharacterAttribute testCharacterAttribute = new CharacterAttribute("test");
+
+            var factory = container.Resolve<IBinaryPackageFactory>();
+            CharacterAttributeBinaryPackage package = new CharacterAttributeBinaryPackage(testCharacterAttribute, factory);
+
+            package.Pack();
+
+            byte[] bytes = BinaryPackageSerializer.Serialize(package);
+
+            Assert.NotEmpty(bytes);
+        }
+
+        [Fact]
+        public void CharacterAttribute_Full_Serialization()
+        {
+            CharacterAttribute characterAttribute = new CharacterAttribute("test");
+            var objectManager = container.Resolve<IObjectManager>();
+
+            objectManager.AddExisting(characterAttribute.StringId, characterAttribute);
+
+            var factory = container.Resolve<IBinaryPackageFactory>();
+            CharacterAttributeBinaryPackage package = new CharacterAttributeBinaryPackage(characterAttribute, factory);
+
+            package.Pack();
+
+            byte[] bytes = BinaryPackageSerializer.Serialize(package);
+
+            Assert.NotEmpty(bytes);
+
+            object obj = BinaryPackageSerializer.Deserialize(bytes);
+
+            Assert.IsType<CharacterAttributeBinaryPackage>(obj);
+
+            CharacterAttributeBinaryPackage returnedPackage = (CharacterAttributeBinaryPackage)obj;
+
+            var deserializeFactory = container.Resolve<IBinaryPackageFactory>();
+            CharacterAttribute newCharacterAttribute = returnedPackage.Unpack<CharacterAttribute>(deserializeFactory);
+
+            Assert.Same(characterAttribute, newCharacterAttribute);
+        }
+    }
+}

@@ -1,0 +1,783 @@
+﻿using Common;
+using Common.Logging;
+using Common.Messaging;
+using Common.Util;
+using GameInterface.Configuration;
+using GameInterface.Policies;
+using GameInterface.Registry.Auto;
+using GameInterface.Services.MapEventParties.Messages;
+using GameInterface.Services.MapEvents.Messages;
+using GameInterface.Services.MapEvents.Messages.Leave;
+using GameInterface.Services.MapEvents.Messages.Start;
+using GameInterface.Services.MapEvents.Participation;
+using GameInterface.Services.Missions;
+using GameInterface.Services.MobileParties.Extensions;
+using GameInterface.Services.ObjectManager;
+using HarmonyLib;
+using Serilog;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.MapEvents;
+using TaleWorlds.CampaignSystem.Party;
+using TaleWorlds.Core;
+
+namespace GameInterface.Services.MapEvents.Patches;
+
+[HarmonyPatch(typeof(MapEvent))]
+internal class MapEventPatches
+{
+    // Stores a removed party so it can be restored later
+    internal readonly record struct RemovedMapEventParty(MapEventSide Side, MapEventParty Party, int Index);
+
+    private static readonly ILogger Logger = LogManager.GetLogger<MapEventPatches>();
+    private static readonly Action<MapEventParty>[] CommitResultPhases =
+    {
+        party => party.CommitXpGain(),
+        CommitRenownChanges,
+        party => party.CommitInfluenceChanges(),
+        party => party.CommitMoraleChanges(),
+        party => party.CommitGoldChanges()
+    };
+
+    private readonly record struct MapEventRewardState(List<RemovedMapEventParty> RemovedParties, float[] StrengthOfSide, float[] RenownValues, float[] InfluenceValues);
+
+    private static void CommitRenownChanges(MapEventParty party)
+    {
+        Hero leaderHero = party.Party.LeaderHero;
+        if (CanCommitRenownChanges(leaderHero))
+        {
+            party.CommitRenownChanges();
+            return;
+        }
+
+        if (party.GainedRenown <= 0f)
+            return;
+
+        Logger.Error(
+            "Skipped {Renown} renown for map event party {PartyId} because leader hero {HeroId} has no clan",
+            party.GainedRenown,
+            party.Party.Id,
+            leaderHero.StringId);
+    }
+
+    internal static bool CanCommitRenownChanges(Hero leaderHero) =>
+        leaderHero == null || leaderHero.Clan != null;
+
+    [HarmonyPatch(nameof(MapEvent.AddInvolvedPartyInternal))]
+    [HarmonyPostfix]
+    private static void Postfix_AddInvolvedPartyInternal(MapEvent __instance, MapEventParty mapEventParty)
+    {
+        // Broadcast the involved parties to clients when a player joins, OR when an AI party joins as a
+        // reinforcement while the join window is still open (InteractionPatches.IsWithinAiJoinWindow). Parties
+        // not controlled by the server are player parties. The window is only ever populated on the server, so
+        // an AI join broadcast stays server-driven; AI joins after the window simply aren't propagated.
+        bool isPlayerJoin = mapEventParty.Party.MobileParty?.IsPlayerParty() == true;
+        if (!isPlayerJoin && !InteractionPatches.IsWithinAiJoinWindow(__instance))
+            return;
+
+        var message = new MapEventInvolvedPartiesAdded(
+            __instance,
+            __instance._sides.SelectMany(side => side.Parties).ToList());
+        MessageBroker.Instance.Publish(__instance, message);
+
+        if (isPlayerJoin && !InteractionPatches.IsInitializingPlayerBattle(__instance))
+        {
+            InteractionPatches.OpenAiJoinWindowAndPublish(
+                __instance,
+                () => MessageBroker.Instance.Publish(__instance, new PlayerJoinedBattle()));
+        }
+    }
+
+    [HarmonyPatch(nameof(MapEvent.RemoveInvolvedPartyInternal))]
+    [HarmonyPostfix]
+    private static void Postfix_RemoveInvolvedPartyInternal(MapEvent __instance, MapEventParty mapEventParty)
+    {
+        if (ModInformation.IsClient
+            || mapEventParty?.Party?.MobileParty is not MobileParty removedParty)
+        {
+            return;
+        }
+
+        MessageBroker.Instance.Publish(__instance, new PartyRemovedFromMapEvent(removedParty));
+    }
+
+    [HarmonyPatch(nameof(MapEvent.FinishBattle))]
+    [HarmonyPrefix]
+    private static bool Prefix_FinishBattle(MapEvent __instance)
+    {
+        if (CallOriginalPolicy.IsOriginalAllowed()) return true;
+
+        if (ModInformation.IsServer
+            && __instance.IsRaidHostileAction()
+            && __instance.BattleState == BattleState.AttackerVictory
+            && __instance.MapEventSettlement?.SettlementHitPoints <= 1E-05f
+            && __instance.ContainsPlayerParty())
+        {
+            // Keep vanilla's bookkeeping before finalization destroys the registry entry.
+            __instance._isFinishCalled = true;
+            // Natural raid completion needs the authoritative exit before vanilla clears the participants.
+            MessageBroker.Instance.Publish(__instance, new MapEventFinalizeAttempted(__instance));
+            return false;
+        }
+
+        return true;
+    }
+
+    [HarmonyPatch(nameof(MapEvent.FinalizeEventAux))]
+    [HarmonyPrefix]
+    [HarmonyPriority(Priority.First)]
+    private static bool Prefix_FinalizeEventAux(MapEvent __instance, out bool __state)
+    {
+        __state = false;
+
+        if (__instance.IsFinalized)
+            return false;
+
+        if (ModInformation.IsServer)
+            MessageBroker.Instance.Publish(__instance, new MapEventContributionFlushRequested(__instance));
+
+        if (CallOriginalPolicy.IsOriginalAllowed())
+            return true;
+
+        if (ModInformation.IsServer)
+        {
+            __state = !__instance.IsFinalized;
+            return true;
+        }
+
+        var message = new MapEventFinalizeAttempted(__instance);
+        MessageBroker.Instance.Publish(__instance, message);
+
+        return false;
+    }
+
+    [HarmonyPatch(nameof(MapEvent.FinalizeEventAux))]
+    [HarmonyPostfix]
+    private static void Postfix_FinalizeEventAux(MapEvent __instance, bool __state, bool __runOriginal)
+    {
+        if (!__runOriginal || !__state)
+            return;
+
+        // Keep the event registered while finalized handlers clear their per-event state.
+        MessageBroker.Instance.Publish(__instance, new MapEventFinalized(__instance));
+        MessageBroker.Instance.Publish(__instance, new InstanceDestroyed<MapEvent>(__instance));
+    }
+
+    [HarmonyPatch(nameof(MapEvent.SetOverrideWinner))]
+    [HarmonyPrefix]
+    private static bool Prefix_SetOverrideWinner(MapEvent __instance, BattleSideEnum winner)
+    {
+        if (ModInformation.IsServer || CallOriginalPolicy.IsOriginalAllowed())
+            return true;
+
+        var state = winner switch
+        {
+            BattleSideEnum.Attacker => BattleState.AttackerVictory,
+            BattleSideEnum.Defender => BattleState.DefenderVictory,
+            _ => BattleState.None
+        };
+
+        // Skip unchanged client writes before the managed setter reports them.
+        return state != __instance.BattleState;
+    }
+
+    [HarmonyPatch(nameof(MapEvent.BattleState), MethodType.Setter)]
+    [HarmonyPrefix]
+    [HarmonyPriority(Priority.First)]
+    private static bool Prefix_BattleState(MapEvent __instance, BattleState value)
+    {
+        if (ModInformation.IsServer &&
+            (value == BattleState.AttackerVictory || value == BattleState.DefenderVictory))
+            MessageBroker.Instance.Publish(__instance, new MapEventContributionFlushRequested(__instance));
+
+        if (CallOriginalPolicy.IsOriginalAllowed())
+        {
+            return true;
+        }
+
+        if (ModInformation.IsServer)
+        {
+            return true;
+        }
+
+        // While the conversing client is accepting a bandit surrender, the victory state is set here
+        // (by SetOverrideWinner) before the surrender is forwarded. Hold back the relay so the server
+        // is not driven to capture before it knows the side surrendered; the forwarded surrender then
+        // drives the authoritative victory and capture instead (at the full surrendered rate).
+        if (BanditSurrenderPatch.InSurrenderConsequence)
+        {
+            return true;
+        }
+
+        // The same victory state can be assigned more than once in quick succession (e.g. accepting
+        // a bandit surrender sets the override winner and then surrenders the enemy side, both
+        // resolving to the same victory). The native setter ignores a no-op change, so only relay an
+        // actual state change to avoid sending a redundant battle result to the server.
+        if (value == __instance.BattleState)
+        {
+            return true;
+        }
+
+        // Coop mission victories use NetworkBattleResultReady so the server can wait for every member and
+        // accepted joiner. The local set still runs so this mission winds down; the server applies the result
+        // only after the completion barrier publishes the authoritative state change.
+        if ((value == BattleState.AttackerVictory || value == BattleState.DefenderVictory)
+            && BattleConclusionGate.IsInCoopBattleMission)
+        {
+            return true;
+        }
+
+        var message = new MapEventBattleStateChangeAttempted(__instance, value);
+        MessageBroker.Instance.Publish(__instance, message);
+
+        return true;
+    }
+
+    [HarmonyPatch(nameof(MapEvent.DoSurrender))]
+    [HarmonyPrefix]
+    private static bool Prefix_DoSurrender(MapEvent __instance, BattleSideEnum side)
+    {
+        if (CallOriginalPolicy.IsOriginalAllowed())
+        {
+            return true;
+        }
+
+        // The defeated troops are captured authoritatively on the server, and the capture rate is
+        // full only when the defeated side is flagged surrendered (otherwise it is the reduced battle
+        // rate). The surrender flag is set here by the native call, but that runs on the conversing
+        // client, which never captures — so forward it for the server to apply before it captures.
+        // This still runs locally too, so the conversing client's own encounter resolves as normal.
+        if (ModInformation.IsClient)
+        {
+            MessageBroker.Instance.Publish(__instance, new MapEventSurrenderAttempted(__instance, side));
+        }
+
+        return true;
+    }
+
+    [HarmonyPatch(nameof(MapEvent.OnBattleWon))]
+    [HarmonyPrefix]
+    private static bool Prefix_OnBattleWon(MapEvent __instance)
+    {
+        // Skip on client
+        if (ModInformation.IsClient)
+            return false;
+
+        // Vanilla calculates plunder from each defeated participant's Party reference.
+        RemovePartiesWithoutParty(__instance);
+        __instance.CalculateMapEventResults();
+
+        if (__instance.ContainsPlayerParty())
+        {
+            // Run a custom implementation of MapEvent.CalculateAndCommitMapEventResults that broadcasts results to players
+            var message = new CommitMapEventResults(__instance);
+            MessageBroker.Instance.Publish(__instance, message);
+        }
+        else
+        {
+            // Mirror native OnBattleWon: a battle without players commits its results directly.
+            __instance.CalculateAndCommitMapEventResults();
+        }
+
+        IBattleObserver battleObserver = __instance.BattleObserver;
+        if (battleObserver == null)
+        {
+            return false;
+        }
+        battleObserver.BattleResultsReady();
+
+        return false;
+    }
+
+    internal static int RemovePartiesWithoutParty(MapEvent mapEvent)
+    {
+        int removedPartyCount = 0;
+
+        foreach (MapEventSide side in mapEvent._sides)
+        {
+            if (side == null)
+                continue;
+
+            for (int i = side._battleParties.Count - 1; i >= 0; i--)
+            {
+                if (side._battleParties[i]?.Party != null)
+                    continue;
+
+                side._battleParties.RemoveAt(i);
+                removedPartyCount++;
+            }
+        }
+
+        return removedPartyCount;
+    }
+
+    // Exclude retreated parties from reward calculations
+    [HarmonyPatch("CalculateMapEventResults")]
+    [HarmonyPrefix]
+    private static void Prefix_CalculateMapEventResults(MapEvent __instance, out MapEventRewardState? __state)
+    {
+        __state = null;
+        if (!ModInformation.IsServer || !ContainerProvider.TryResolve<IRetreatedMapEventPartyTracker>(out var tracker)) return;
+
+        var removedParties = RemoveParties(__instance, party => tracker.IsRetreated(__instance, party.Party));
+
+        if (removedParties.Count == 0) return;
+        
+        __state = new MapEventRewardState(removedParties,
+            __instance.StrengthOfSide.ToArray(), 
+            __instance._sides.Select(side => side?.RenownValue ?? 0f).ToArray(), 
+            __instance._sides.Select(side => side?.InfluenceValue ?? 0f).ToArray());
+
+        foreach (RemovedMapEventParty removedParty in removedParties)
+        {
+            int side = (int)removedParty.Side.MissionSide;
+            __instance.StrengthOfSide[side] -= removedParty.Party.Party.GetCustomStrength(removedParty.Side.MissionSide, __instance.SimulationContext);
+        }
+
+        foreach (MapEventSide side in __instance._sides)
+        {
+            side?.CalculateRenownAndInfluenceValuesOnPartyInvolved(__instance.StrengthOfSide);
+        }
+
+    }
+
+    // Restore the pre-calculation reward inputs and parties
+    [HarmonyPatch("CalculateMapEventResults")]
+    [HarmonyFinalizer]
+    private static void Finalizer_CalculateMapEventResults(MapEvent __instance, MapEventRewardState? __state)
+    {
+        if (!__state.HasValue) return;
+
+        MapEventRewardState state = __state.Value;
+
+        for (int i = 0; i < __instance.StrengthOfSide.Length; i++)
+        {
+            __instance.StrengthOfSide[i] = state.StrengthOfSide[i];
+
+            if (__instance._sides[i] == null) continue;
+
+            __instance._sides[i].RenownValue = state.RenownValues[i];
+            __instance._sides[i].InfluenceValue = state.InfluenceValues[i];
+        }
+
+        RestoreParties(state.RemovedParties);
+    }
+
+    // Exclude retreated parties from defeat penalties
+    [HarmonyPatch("ApplyMoraleAndBehaviorUpdatesOfDefeatedParties")]
+    [HarmonyPrefix]
+    private static void Prefix_ApplyMoraleAndBehaviorUpdatesOfDefeatedParties(MapEvent __instance, out List<RemovedMapEventParty> __state)
+    {
+        __state = null;
+        if (!ModInformation.IsServer || !ContainerProvider.TryResolve<IRetreatedMapEventPartyTracker>(out var tracker))
+        {
+            return;
+        }
+
+        __state = RemoveParties(__instance, party => tracker.IsRetreated(__instance, party.Party));
+    }
+
+    // Restore the parties after applying defeat penalties
+    [HarmonyPatch("ApplyMoraleAndBehaviorUpdatesOfDefeatedParties")]
+    [HarmonyFinalizer]
+    private static void Finalizer_ApplyMoraleAndBehaviorUpdatesOfDefeatedParties(
+        List<RemovedMapEventParty> __state)
+    {
+        RestoreParties(__state);
+    }
+
+    /// <summary>
+    /// Removes matching parties and stores their original position
+    /// </summary>
+    internal static List<RemovedMapEventParty> RemoveParties(
+        MapEvent mapEvent,
+        Func<MapEventParty, bool> shouldRemove)
+    {
+        var removedParties = new List<RemovedMapEventParty>();
+
+        foreach (MapEventSide side in mapEvent._sides)
+        {
+            if (side == null) continue;
+
+            for (int i = side._battleParties.Count - 1; i >= 0; i--)
+            {
+                MapEventParty party = side._battleParties[i];
+                if (party?.Party == null || !shouldRemove(party)) continue;
+
+                removedParties.Add(new RemovedMapEventParty(side, party, i));
+                side._battleParties.RemoveAt(i);
+            }
+        }
+
+        return removedParties;
+    }
+
+    // Restores remove parties to their original position
+    internal static void RestoreParties(List<RemovedMapEventParty> removedParties)
+    {
+        if (removedParties == null) return;
+
+        for (int i = removedParties.Count - 1; i >= 0; i--)
+        {
+            RemovedMapEventParty removedParty = removedParties[i];
+            removedParty.Side._battleParties.Insert(removedParty.Index, removedParty.Party);
+        }
+    }
+
+    [HarmonyPatch("CommitCalculatedMapEventResults")]
+    [HarmonyPrefix]
+    private static bool Prefix_CommitCalculatedMapEventResults(MapEvent __instance)
+    {
+        if (ModInformation.IsClient)
+            return CallOriginalPolicy.IsOriginalAllowed();
+
+        int removedPartyCount;
+        using (AllowedThread.Suspend())
+        {
+            removedPartyCount = CommitCalculatedMapEventResults(__instance, CommitResultPhases);
+        }
+        if (removedPartyCount > 0)
+        {
+            Logger.Error(
+                "Removed {PartyCount} map event parties without a Party from {MapEventId} before committing battle results",
+                removedPartyCount,
+                __instance.StringId);
+        }
+
+        return false;
+    }
+
+    internal static int CommitCalculatedMapEventResults(MapEvent mapEvent, IReadOnlyList<Action<MapEventParty>> commitPhases, Func<MapEventParty, bool> canCommitParty = null)
+    {
+        int removedPartyCount = RemovePartiesWithoutParty(mapEvent);
+
+        foreach (MapEventSide side in mapEvent._sides)
+        {
+            if (side == null) continue;
+
+            foreach (Action<MapEventParty> commitPhase in commitPhases)
+            {
+                MapEventParty[] parties = side.Parties.ToArray();
+                foreach (MapEventParty party in parties)
+                {
+                    if (!side._battleParties.Contains(party) || party?.Party == null || canCommitParty?.Invoke(party) == false)
+                    {
+                        continue;
+                    }
+
+                    commitPhase(party);
+                    removedPartyCount += RemovePartiesWithoutParty(mapEvent);
+                }
+            }
+        }
+
+        return removedPartyCount;
+    }
+
+    internal static int CommitCalculatedMapEventResults(MapEvent mapEvent, Func<MapEventParty, bool> canCommitParty)
+    {
+        return CommitCalculatedMapEventResults(mapEvent, CommitResultPhases, canCommitParty);
+    }
+
+    [HarmonyPatch(nameof(MapEvent.Update))]
+    [HarmonyPrefix]
+    private static bool PrefixUpdate(MapEvent __instance)
+    {
+        // Clients never tick a map event locally; the server is authoritative for battle resolution.
+        if (ModInformation.IsClient)
+            return false;
+
+        bool hasPlayerParty = __instance.InvolvedParties.Any(
+            x => x != null && x.IsMobile && !x.MobileParty.IsControlledByThisInstance());
+
+        // Siege map events must not enter native campaign resolution, even on an allowed-thread setup path.
+        if (hasPlayerParty && !__instance.IsRaidHostileAction())
+            return false;
+
+        // Receive path / setup: let the original run when patches are standing down.
+        if (CallOriginalPolicy.IsOriginalAllowed())
+            return true;
+
+        if (!RepairLeaderParties(__instance))
+            return false;
+
+        if (__instance.IsRaidHostileAction())
+        {
+            RaidAiInterventionSuppression.SuppressJoinedDefenders(__instance);
+
+            // Slow raids need campaign-map progress, but not while their battle mission is occupied.
+            if (__instance.IsActiveSlowVillageRaid())
+                return !HasOccupiedBattleMission(__instance);
+        }
+
+        if (hasPlayerParty)
+            return false;
+
+        // A settlement PartyBase is a complete participant even though it has no MobileParty.
+        if (__instance.InvolvedParties.Any(x => x is null || (!x.IsMobile && !x.IsSettlement)))
+            return false;
+
+        return true;
+    }
+
+    private static bool RepairLeaderParties(MapEvent mapEvent)
+    {
+        if (mapEvent._sides == null || mapEvent._sides.Length < 2 ||
+            mapEvent._sides[0] == null || mapEvent._sides[1] == null)
+            return false;
+
+        foreach (var side in mapEvent._sides)
+        {
+            if (side._battleParties == null)
+                return false;
+
+            // Loaded events can retain a removed leader after their last party has gone.
+            if (side._battleParties.Count == 0)
+            {
+                Logger.Warning("Finalizing map event {MapEventId} because {Side} side has no parties",
+                    mapEvent.StringId, side.MissionSide);
+                mapEvent.FinalizeEvent();
+                return false;
+            }
+
+            var leaderParty = side.LeaderParty;
+            if (leaderParty != null &&
+                side._battleParties.Any(entry => ReferenceEquals(entry?.Party, leaderParty)))
+                continue;
+
+            var replacement = side._battleParties
+                .Select(entry => entry?.Party)
+                .FirstOrDefault(party => party != null);
+            if (replacement == null)
+                continue;
+
+            side.InvalidateSimulationSetup();
+            side.LeaderParty = replacement;
+            side._mapFaction = replacement.MapFaction;
+            side.CacheLeaderSimulationModifier();
+            Logger.Warning(
+                "Repaired missing or stale leader party on {Side} side of map event {MapEventId} using {PartyId}",
+                side.MissionSide,
+                mapEvent.StringId,
+                replacement.Id);
+        }
+
+        return true;
+    }
+
+    private static bool HasOccupiedBattleMission(MapEvent mapEvent)
+    {
+        if (!ContainerProvider.TryResolve<IObjectManager>(out var objectManager) ||
+            !objectManager.TryGetId(mapEvent, out var mapEventId) ||
+            !ContainerProvider.TryResolve<IMissionMembershipRegistry>(out var membershipRegistry))
+            return false;
+
+        return ServerBattleModeArbiter.IsMissionClaimed(mapEventId) &&
+               membershipRegistry.IsInstanceOccupied(mapEventId);
+    }
+
+    [HarmonyPrefix]
+    [HarmonyPatch(nameof(MapEvent.Initialize))]
+    static bool PrefixInitialize(MapEvent __instance, PartyBase attackerParty, PartyBase defenderParty, MapEventComponent component, MapEvent.BattleTypes mapEventType)
+    {
+        if (CallOriginalPolicy.IsOriginalAllowed()) return true;
+
+        // Only run on server
+        return ModInformation.IsServer;
+    }
+}
+
+[HarmonyPatch]
+internal class InteractionPatches
+{
+    private sealed class PlayerBattleWindows
+    {
+        private readonly bool aiJoinWindowEnabled;
+
+        public CampaignTime AiJoinWindowExpiresAt { get; }
+        public CampaignTime GoldFoodConsumptionWindowExpiresAt { get; }
+
+        public PlayerBattleWindows(int aiJoinWindowHours, int goldFoodConsumptionWindowHours = 24)
+        {
+            aiJoinWindowEnabled = aiJoinWindowHours > 0;
+            AiJoinWindowExpiresAt = CampaignTime.HoursFromNow(aiJoinWindowHours);
+            GoldFoodConsumptionWindowExpiresAt = CampaignTime.HoursFromNow(goldFoodConsumptionWindowHours);
+        }
+
+        public bool AiJoinWindowExpired => !aiJoinWindowEnabled || CampaignTime.Now > AiJoinWindowExpiresAt;
+        public bool GoldFoodConsumptionExpired => CampaignTime.Now > GoldFoodConsumptionWindowExpiresAt;
+    }
+
+    [HarmonyPatch(typeof(PartyBase), "TaleWorlds.CampaignSystem.Map.IInteractablePoint.CanPartyInteract")]
+    [HarmonyPostfix]
+    private static void Postfix_CanPartyInteract(
+        PartyBase __instance,
+        MobileParty mobileParty,
+        ref bool __result)
+    {
+        if (!__result)
+            return;
+
+        if (ModInformation.IsClient)
+            return;
+
+        // NOTE: the "both parties are players" block was intentionally removed to re-enable PvP — two player
+        // parties must be able to interact to start/join a battle with each other.
+
+        // A party held in a conversation with a player can only be interacted with by that player's party. This is
+        // the hard stop that keeps other AI parties from starting an encounter or battle with it, since
+        // OnPartyInteraction only runs when this check passes.
+        if (ConversationPartyHold.IsInteractionBlocked(__instance, mobileParty))
+        {
+            __result = false;
+        }
+    }
+
+    private static readonly ConditionalWeakTable<MapEvent, PlayerBattleWindows> playerBattleWindows = new();
+    private static readonly ConditionalWeakTable<MapEvent, object> initializingPlayerBattles = new();
+
+    /// <summary>True while a player's battle is still within its post-start window for AI parties to join as
+    /// reinforcements (<see cref="ModConfigProvider.ModOptions.PlayerBattleAiJoinWindowHours"/>). The window is opened after
+    /// initialization; only the server ever populates it, so this is a server-side query.</summary>
+    public static bool IsWithinAiJoinWindow(MapEvent mapEvent)
+        => playerBattleWindows.TryGetValue(mapEvent, out var window) && !window.AiJoinWindowExpired;
+
+    internal static bool IsInitializingPlayerBattle(MapEvent mapEvent)
+        => initializingPlayerBattles.TryGetValue(mapEvent, out _);
+
+    public static bool IsWithinGoldFoodConsumptionWindow(MapEvent mapEvent)
+        => playerBattleWindows.TryGetValue(mapEvent, out var window) && !window.GoldFoodConsumptionExpired;
+
+    [HarmonyPatch(typeof(MapEvent), nameof(MapEvent.CanPartyJoinBattle))]
+    [HarmonyPrefix]
+    private static bool Prefix_CanPartyJoinBattle(MapEvent __instance, PartyBase party, ref bool __result)
+    {
+        if (CanEvaluateJoinBattle(__instance, party))
+            return true;
+
+        __result = true;
+        return false;
+    }
+
+    // The vanilla check dereferences the passed party's MapFaction and, for every MapEventParty on both
+    // sides, its Party and that Party's MapFaction. On the client those sync in over several messages, so
+    // all must be present before the check can run without hitting un-ready state.
+    internal static bool CanEvaluateJoinBattle(MapEvent mapEvent, PartyBase party)
+    {
+        if (mapEvent?.AttackerSide == null || mapEvent.DefenderSide == null)
+            return false;
+
+        if (party?.MapFaction == null)
+            return false;
+
+        return PartiesResolved(mapEvent.AttackerSide) && PartiesResolved(mapEvent.DefenderSide);
+    }
+
+    private static bool PartiesResolved(MapEventSide side)
+    {
+        foreach (var mapEventParty in side.Parties)
+        {
+            if (mapEventParty?.Party?.MapFaction == null)
+                return false;
+        }
+
+        return true;
+    }
+
+    [HarmonyPatch(typeof(MapEvent), nameof(MapEvent.CanPartyJoinBattle))]
+    [HarmonyPostfix]
+    private static void Postfix_CanPartyJoinBattle(
+        MapEvent __instance,
+        PartyBase party,
+        ref bool __result)
+    {
+        // Always allow a player party to join, on both client and server. The joining client evaluates this when
+        // building the encounter "join the battle" menu options; native can return false there (e.g. war state /
+        // side expectations not matching on the client), which would hide the join option. Force it true so the
+        // player can always join.
+        if (party?.MobileParty?.IsPlayerParty() == true)
+        {
+            __result = true;
+            return;
+        }
+
+        // AI gating below is server-authoritative only.
+        if (ModInformation.IsClient)
+            return;
+
+        if (!__result)
+            return;
+
+        if (__instance.IsRaidAiInterventionSuppressed())
+        {
+            __result = false;
+            return;
+        }
+
+        if (__instance.IsRaidHostileAction() && MapEventConfig.AllowRaidAiIntervention)
+            return;
+
+        // Allow AI to join if no players are involved
+        if (!__instance.ContainsPlayerParty())
+            return;
+
+        // A player's battle stays open to AI reinforcements for a campaign day after it begins. While the
+        // window is open, AI may keep joining; once it expires —
+        // or if no window was opened for this event — no more AI may join a player's battle.
+        if (IsInitializingPlayerBattle(__instance) || IsWithinAiJoinWindow(__instance))
+            return;
+
+        __result = false;
+    }
+
+    [HarmonyPatch(typeof(MapEvent), nameof(MapEvent.Initialize))]
+    [HarmonyPrefix]
+    private static void Prefix_Initialize(
+        MapEvent __instance,
+        PartyBase attackerParty,
+        PartyBase defenderParty)
+    {
+        if (ModInformation.IsClient || !StartsWithPlayerParty(attackerParty, defenderParty))
+            return;
+
+        initializingPlayerBattles.GetValue(__instance, _ => new object());
+    }
+
+    [HarmonyPatch(typeof(MapEvent), nameof(MapEvent.Initialize))]
+    [HarmonyPostfix]
+    private static void Postfix_Initialize(
+        MapEvent __instance,
+        PartyBase attackerParty,
+        PartyBase defenderParty)
+    {
+        if (ModInformation.IsClient || !StartsWithPlayerParty(attackerParty, defenderParty))
+            return;
+
+        initializingPlayerBattles.Remove(__instance);
+        OpenAiJoinWindowAndPublish(
+            __instance,
+            () => MessageBroker.Instance.Publish(__instance, new PlayerJoinedBattle()));
+    }
+
+    internal static void OpenAiJoinWindowAndPublish(MapEvent mapEvent, Action publish)
+    {
+        playerBattleWindows.GetValue(
+            mapEvent,
+            _ => new PlayerBattleWindows(ModConfigProvider.ModOptions.PlayerBattleAiJoinWindowHours));
+        publish();
+    }
+
+    [HarmonyPatch(typeof(MapEvent), nameof(MapEvent.Initialize))]
+    [HarmonyFinalizer]
+    private static void Finalizer_Initialize(MapEvent __instance)
+    {
+        initializingPlayerBattles.Remove(__instance);
+    }
+
+    private static bool StartsWithPlayerParty(PartyBase attackerParty, PartyBase defenderParty)
+        => attackerParty.MobileParty?.IsPlayerParty() == true ||
+           defenderParty.MobileParty?.IsPlayerParty() == true;
+}

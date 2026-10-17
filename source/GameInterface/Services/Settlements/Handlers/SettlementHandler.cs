@@ -1,0 +1,215 @@
+﻿using Common;
+using Common.Logging;
+using Common.Messaging;
+using Common.Network;
+using GameInterface.Services.ObjectManager;
+using GameInterface.Services.Settlements.Messages;
+using GameInterface.Services.Settlements.Patches;
+using Serilog;
+using System;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.Party;
+using TaleWorlds.CampaignSystem.Settlements;
+using static TaleWorlds.CampaignSystem.Settlements.Settlement;
+
+namespace GameInterface.Services.Settlements.Handlers;
+
+/// <summary>
+/// Handles Syncs for Settlement Patches
+/// </summary>
+public class SettlementHandler : IHandler
+{
+    private static readonly ILogger Logger = LogManager.GetLogger<SettlementHandler>();
+    private readonly IMessageBroker messageBroker;
+    private readonly IObjectManager objectManager;
+    private readonly INetwork network;
+
+    public SettlementHandler(IMessageBroker messageBroker, INetwork network, IObjectManager objectManager)
+    {
+        this.messageBroker = messageBroker;
+        this.network = network;
+        this.objectManager = objectManager;
+
+        messageBroker.Subscribe<ChangeSettlementBribePaid>(HandleBribePaid);
+        messageBroker.Subscribe<ChangeSettlementLastAttackerParty>(HandleLastAttackerParty);
+        messageBroker.Subscribe<ChangeSettlementLastThreatTime>(HandleLastThreatTime);
+        messageBroker.Subscribe<ChangeSettlementCurrentSiegeState>(HandleCurrentSiegeState);
+        messageBroker.Subscribe<ChangeSettlementMilitia>(HandleMilitia);
+        messageBroker.Subscribe<ChangeSettlementGarrisonWagePaymentLimit>(HandleGarrisonWageLimit);
+        messageBroker.Subscribe<ChangeMobileParty>(HandleMobileParty);
+        messageBroker.Subscribe<ChangeSettlementWallHitPointsRatio>(HandleHitPointsRatio);
+
+        messageBroker.Subscribe<ChangeSettlementLastVisitTimeOfOwner>(HandleLastVisitTimeOfOwner);
+
+        messageBroker.Subscribe<NewGarrisonParty>(HandleNewGarrisonParty);
+        messageBroker.Subscribe<NetworkNewGarrisonParty>(HandleNetworkNewGarrisonParty);
+    }
+
+    private void HandleLastVisitTimeOfOwner(MessagePayload<ChangeSettlementLastVisitTimeOfOwner> payload)
+    {
+        var data = payload.What;
+
+        GameThread.Run(() =>
+        {
+            try
+            {
+                if (objectManager.TryGetObject<Settlement>(data.SettlementID, out var settlement) == false)
+                {
+                    Logger.Error("Unable to find Settlement ({SettlementId})", data.SettlementID);
+                    return;
+                }
+
+                LastVisitTimeOwnerSettlementActionPatch.RunLastVisitTimeOfOwner(settlement, data.CurrentTime);
+            }
+            catch (Exception e)
+            {
+                Logger.Error(e, "Failed to apply ChangeSettlementLastVisitTimeOfOwner");
+            }
+        });
+    }
+
+    private void HandleHitPointsRatio(MessagePayload<ChangeSettlementWallHitPointsRatio> payload)
+    {
+        var obj = payload.What;
+        if (objectManager.TryGetObject<Settlement>(obj.SettlementId, out var settlement) == false)
+        {
+            Logger.Error("Unable to find Settlement ({SettlementId})", obj.SettlementId);
+            return;
+        }
+
+        SetWallHitPointsSettlementPatch.RunSetWallSectionHitPointsRatioAtIndex(settlement, obj.index, obj.hitPointsRatio);
+        
+    }
+
+    private void HandleMobileParty(MessagePayload<ChangeMobileParty> payload)
+    {
+        GameThread.RunSafe(() =>
+        {
+            var obj = payload.What;
+            if (objectManager.TryGetObject<Settlement>(obj.SettlementId, out var settlement) == false)
+            {
+                Logger.Error("Unable to find Settlement ({SettlementId})", obj.SettlementId);
+                return;
+            }
+
+            if (objectManager.TryGetObject<MobileParty>(obj.MobilePartyId, out var mobileParty) == false)
+            {
+                Logger.Error("Unable to find MobileParty ({MobilePartyId})", obj.MobilePartyId);
+                return;
+            }
+
+            MobilePartyCachePatch.RunMobileParty(settlement, mobileParty, obj.AddMobileParty);
+        });
+    }
+
+    private void HandleGarrisonWageLimit(MessagePayload<ChangeSettlementGarrisonWagePaymentLimit> payload)
+    {
+        var obj = payload.What;
+        if (objectManager.TryGetObject<Settlement>(obj.SettlementId, out var settlement) == false)
+        {
+            Logger.Error("Unable to find Settlement ({SettlementId})", obj.SettlementId);
+            return;
+        }
+
+        GarrisonWagePaymentLimitSettlementPatch.RunGarrisonWagePaymentLimitChange(settlement, obj.GarrisonWagePaymentLimit);
+    }
+
+    private void HandleMilitia(MessagePayload<ChangeSettlementMilitia> payload)
+    {
+        var obj = payload.What;
+        if (objectManager.TryGetObject<Settlement>(obj.SettlementId, out var settlement) == false)
+        {
+            Logger.Error("Unable to find Settlement ({SettlementId})", obj.SettlementId);
+            return;
+        }
+
+        MilitiaSettlementPatch.RunMiltiaChange(settlement, obj.Militia);
+    }
+
+    private void HandleCurrentSiegeState(MessagePayload<ChangeSettlementCurrentSiegeState> payload)
+    {
+        var obj = payload.What;
+        if (objectManager.TryGetObject<Settlement>(obj.SettlementId, out var settlement) == false)
+        {
+            Logger.Error("Unable to find Settlement ({SettlementId})", obj.SettlementId);
+            return;
+        }
+
+        CurrentSiegeStateSettlementPatch.RunCurrentSiegeStateChange(settlement, (SiegeState)obj.CurrentSiegeState);
+    }
+
+    private void HandleLastThreatTime(MessagePayload<ChangeSettlementLastThreatTime> payload)
+    {
+        var obj = payload.What;
+        if (objectManager.TryGetObject<Settlement>(obj.SettlementId, out var settlement) == false)
+        {
+            Logger.Error("Unable to find Settlement ({SettlementId})", obj.SettlementId);
+            return;
+        }
+
+        LastThreatTimeSettlementPatch.LastThreatTimeChange(settlement, obj.LastThreatTimeTicks);
+    }
+
+    private void HandleLastAttackerParty(MessagePayload<ChangeSettlementLastAttackerParty> payload)
+    {
+        var obj = payload.What;
+        if (objectManager.TryGetObject<Settlement>(obj.SettlementId, out var settlement) == false)
+        {
+            Logger.Error("Unable to find Settlement ({SettlementId})", obj.SettlementId);
+            return;
+        }
+        if (objectManager.TryGetObject<MobileParty>(obj.AttackerPartyId, out var mobileParty) == false)
+        {
+            Logger.Error("Unable to find Settlement ({SettlementId})", obj.SettlementId);
+            return;
+        }
+
+        LastAttackerPartySettlementPatch.RunLastAttackerPartyChange(settlement, mobileParty);
+
+    }
+
+    private void HandleBribePaid(MessagePayload<ChangeSettlementBribePaid> payload)
+    {
+        var obj = payload.What;
+
+        if (objectManager.TryGetObject<Settlement>(obj.SettlementId, out var settlement) == false)
+        {
+            Logger.Error("Unable to find Settlement ({SettlementId})", obj.SettlementId);
+            return;
+        }
+        BribePaidSettlementPatch.RunBribePaidChange(settlement, obj.BribePaid);
+    }
+
+    private void HandleNewGarrisonParty(MessagePayload<NewGarrisonParty> payload)
+    {
+        if (!objectManager.TryGetIdWithLogging(payload.What.Settlement, out var settlementId)) return;
+
+        network.SendAll(new NetworkNewGarrisonParty(settlementId));
+    }
+
+    private void HandleNetworkNewGarrisonParty(MessagePayload<NetworkNewGarrisonParty> payload)
+    {
+        GameThread.RunSafe(() =>
+        {
+            if (!objectManager.TryGetObjectWithLogging<Settlement>(payload.What.SettlementId, out var settlement)) return;
+            if (settlement.Town.GarrisonParty != null) return;
+            settlement.AddGarrisonParty();
+        });
+    }
+
+    public void Dispose()
+    {
+        messageBroker.Unsubscribe<ChangeSettlementBribePaid>(HandleBribePaid);
+        messageBroker.Unsubscribe<ChangeSettlementLastAttackerParty>(HandleLastAttackerParty);
+        messageBroker.Unsubscribe<ChangeSettlementLastThreatTime>(HandleLastThreatTime);
+        messageBroker.Unsubscribe<ChangeSettlementCurrentSiegeState>(HandleCurrentSiegeState);
+        messageBroker.Unsubscribe<ChangeSettlementMilitia>(HandleMilitia);
+        messageBroker.Unsubscribe<ChangeSettlementGarrisonWagePaymentLimit>(HandleGarrisonWageLimit);
+        messageBroker.Unsubscribe<ChangeMobileParty>(HandleMobileParty);
+        messageBroker.Unsubscribe<ChangeSettlementWallHitPointsRatio>(HandleHitPointsRatio);
+        messageBroker.Unsubscribe<ChangeSettlementLastVisitTimeOfOwner>(HandleLastVisitTimeOfOwner);
+
+        messageBroker.Unsubscribe<NewGarrisonParty>(HandleNewGarrisonParty);
+        messageBroker.Unsubscribe<NetworkNewGarrisonParty>(HandleNetworkNewGarrisonParty);
+    }
+}

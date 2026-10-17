@@ -1,0 +1,191 @@
+﻿using Common;
+using Common.Logging;
+using Common.Messaging;
+using Common.Network;
+using Coop.Core.Client.Messages;
+using Coop.Core.Client.Services.Heroes.Messages;
+using Coop.Core.Server.Connections.Messages;
+using GameInterface.Services.Heroes.Interfaces;
+using GameInterface.Services.ObjectManager;
+using GameInterface.Services.Players;
+using GameInterface.Services.Players.Data;
+using LiteNetLib;
+using Serilog;
+using TaleWorlds.CampaignSystem;
+
+namespace Coop.Core.Server.Connections.States;
+
+/// <summary>
+/// State representing a connection creating a character
+/// </summary>
+public class CreateCharacterState : ConnectionStateBase
+{
+    private readonly ILogger Logger = LogManager.GetLogger<CreateCharacterState>();
+    private readonly IObjectManager objectManager;
+    private readonly IMessageBroker messageBroker;
+    private readonly INetwork network;
+    private readonly IHeroInterface heroInterface;
+    private readonly IPlayerManager playerManager;
+    private readonly IPlayerCreationRollback playerCreationRollback;
+    private readonly IExistingPlayerSender existingPlayerSender;
+
+    public CreateCharacterState(
+        IConnectionLogic connectionLogic,
+        IObjectManager objectManager,
+        IMessageBroker messageBroker,
+        INetwork network,
+        IHeroInterface heroInterface,
+        IPlayerManager playerManager,
+        IPlayerCreationRollback playerCreationRollback,
+        IExistingPlayerSender existingPlayerSender)
+        : base(connectionLogic)
+    {
+        this.objectManager = objectManager;
+        this.messageBroker = messageBroker;
+        this.network = network;
+        this.heroInterface = heroInterface;
+        this.playerManager = playerManager;
+        this.playerCreationRollback = playerCreationRollback;
+        this.existingPlayerSender = existingPlayerSender;
+        messageBroker.Subscribe<NetworkTransferNewHero>(Handle_NetworkTransferNewHero);
+    }
+
+    public override void Dispose()
+    {
+        messageBroker.Unsubscribe<NetworkTransferNewHero>(Handle_NetworkTransferNewHero);
+    }
+
+    internal void Handle_NetworkTransferNewHero(MessagePayload<NetworkTransferNewHero> obj)
+    {
+        var netPeer = obj.Who as NetPeer;
+
+        if (netPeer != ConnectionLogic.Peer) return;
+
+        var controllerId = obj.What.PlayerId;
+        var data = obj.What.PlayerHero;
+
+        Logger.Debug("Unpacking hero for {ControllerId}", controllerId);
+
+        var hero = heroInterface.ServerUnpackHero(data);
+
+        if (!TryCreatePlayer(controllerId, hero, out var player))
+        {
+            Logger.Error("Failed to create player; disconnecting the joining peer");
+            ConnectionLogic.Peer.Disconnect();
+            return;
+        }
+
+        if (!heroInterface.TryGetRegistrationHandles(hero, out var registrationHandles))
+        {
+            Logger.Error("Failed to capture player graph handles; disconnecting the joining peer");
+            GameThread.RunCleanupSafe(() =>
+            {
+                var registrationIds = playerCreationRollback.CaptureRegistrationIds(player);
+                playerCreationRollback.Rollback(player, registrationIds);
+            }, then: () => ConnectionLogic.Peer.Disconnect(), context: "CreateCharacterState.PlayerCreationRollback");
+            return;
+        }
+
+        if (!playerManager.AddPlayer(player))
+        {
+            // The controller already holds a registration — two joins for it raced into character
+            // creation before either finished. Everything below assumes this peer owns the player
+            // it just created, so continuing would bind the peer to the *other* registration and
+            // announce this refused one to the joiner and every other client. Drop the connection
+            // instead, exactly as a failed create does above.
+            Logger.Error(
+                "Controller {ControllerId} is already registered; disconnecting the joining peer",
+                controllerId);
+            ConnectionLogic.Peer.Disconnect();
+            return;
+        }
+
+        // First join: associate this peer with the player it just created.
+        playerManager.SetPeer(controllerId, netPeer);
+        // Send created to all other clients
+        var message = new NetworkNewPlayerHeroCreated(controllerId, player, data, registrationHandles);
+        network.SendAllBut(netPeer, message);
+
+        // Run authoritative setup only after existing clients can create the referenced hero graph. Follow-up
+        // messages use the same reliable-ordered channel; the joining peer is still dropping pre-snapshot deltas.
+        try
+        {
+            heroInterface.SetupServerHero(hero);
+        }
+        catch (System.Exception exception)
+        {
+            Logger.Error(
+                exception,
+                "Failed to set up hero for {ControllerId}; disconnecting the joining peer",
+                controllerId);
+
+            var registrationIds = System.Array.Empty<string>();
+            GameThread.RunCleanupSafe(() =>
+            {
+                if (!playerManager.RemovePlayer(player))
+                    Logger.Error("Failed to roll back player registration for {ControllerId}", controllerId);
+
+                registrationIds = playerCreationRollback.CaptureRegistrationIds(player);
+                playerCreationRollback.Rollback(player, registrationIds);
+            }, then: () =>
+            {
+                // Existing clients created this graph before setup ran. This final ordered message removes their
+                // player registration and every imported graph object after any setup-side cleanup broadcasts.
+                network.SendAllBut(netPeer, new NetworkPlayerCreationRolledBack(player, registrationIds));
+                ConnectionLogic.Peer.Disconnect();
+            }, context: "CreateCharacterState.PlayerCreationRollback");
+            return;
+        }
+
+        // Respond with ids for the creating client
+        network.SendImmediate(netPeer, new NetworkHeroRecieved(player));
+
+        ConnectionLogic.TransferSave();
+
+        // TransferSave has taken the save snapshot and begun queueing this peer's broadcasts, so tell the
+        // joiner about every other existing player. These queue and replay once it enters its campaign.
+        existingPlayerSender.SendExistingPlayers(netPeer, controllerId);
+    }
+
+    private bool TryCreatePlayer(string controllerId, Hero hero, out Player player)
+    {
+        player = null;
+
+        if (!objectManager.TryGetIdWithLogging(hero, out var heroId))
+            return false;
+        if (!objectManager.TryGetIdWithLogging(hero.PartyBelongedTo, out var mobilePartyId))
+            return false;
+        if (!objectManager.TryGetIdWithLogging(hero.Clan, out var clanId))
+            return false;
+        if (!objectManager.TryGetIdWithLogging(hero.CharacterObject, out var characterObjectId))
+            return false;
+
+        player = new Player(controllerId, heroId, mobilePartyId, clanId, characterObjectId);
+        return true;
+    }
+
+    public override void CreateCharacter()
+    {
+    }
+
+    public override void EnterCampaign()
+    {
+    }
+
+    public override void EnterMission()
+    {
+    }
+
+    public override void Load()
+    {
+    }
+
+    public override void TransferSave()
+    {
+        // SetState packages and sends the save synchronously; then move to LoadingState to await the
+        // client reporting it has entered the campaign. Load() must run here (not inside the
+        // TransferSaveState ctor) so it resolves against TransferSaveState, not this state.
+        ConnectionLogic.SetState<TransferSaveState>();
+        ConnectionLogic.Load();
+    }
+}

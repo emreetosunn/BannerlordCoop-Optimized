@@ -1,0 +1,77 @@
+﻿using Common.Messaging;
+using Common.Network;
+using Coop.Core.Common;
+using Coop.Core.Common.Session;
+using GameInterface;
+using GameInterface.Registry;
+using GameInterface.Services.Entity;
+using GameInterface.Services.GameState.Interfaces;
+using GameInterface.Services.Heroes.Interfaces;
+using GameInterface.Services.Modules;
+using GameInterface.Services.Players;
+using GameInterface.Services.Time.Interfaces;
+using GameInterface.Services.UI.Interfaces;
+using GameInterface.Services.UI.JoinCancel;
+
+namespace Coop.Core.Client.States;
+
+/// <summary>
+/// Aggregates the services shared across the client states so each state can be created with
+/// <c>new</c> instead of being resolved from the DI container. Threaded through the client state
+/// machine by <see cref="ClientLogic"/>.
+/// </summary>
+public class ClientContext
+{
+    public ClientContext(
+        IMessageBroker messageBroker,
+        INetwork network,
+        IGameInterface gameInterface,
+        IGameStateInterface gameStateInterface,
+        ILoadingInterface loadingInterface,
+        IControllerIdProvider controllerIdProvider,
+        ICoopFinalizer coopFinalizer,
+        IModuleInfoProvider moduleInfoProvider,
+        IModuleNameProvider moduleNameProvider,
+        IHeroInterface heroInterface,
+        IRegistryManager registryManager,
+        IPlayerManager playerManager,
+        IMapTimeTrackerInterface mapTimeTrackerInterface,
+        IJoinAttemptOverlay joinAttemptOverlay,
+        JoinAttemptPresentation joinAttempt,
+        IPatchFailureReport patchFailureReport)
+    {
+        MessageBroker = messageBroker;
+        Network = network;
+        GameInterface = gameInterface;
+        GameStateInterface = gameStateInterface;
+        LoadingInterface = loadingInterface;
+        ControllerIdProvider = controllerIdProvider;
+        CoopFinalizer = coopFinalizer;
+        ModuleInfoProvider = moduleInfoProvider;
+        ModuleNameProvider = moduleNameProvider;
+        HeroInterface = heroInterface;
+        RegistryManager = registryManager;
+        PlayerManager = playerManager;
+        MapTimeTrackerInterface = mapTimeTrackerInterface;
+        JoinAttemptOverlay = joinAttemptOverlay;
+        JoinAttempt = joinAttempt;
+        PatchFailureReport = patchFailureReport;
+    }
+
+    public IMessageBroker MessageBroker { get; }
+    public INetwork Network { get; }
+    public IGameInterface GameInterface { get; }
+    public IGameStateInterface GameStateInterface { get; }
+    public ILoadingInterface LoadingInterface { get; }
+    public IControllerIdProvider ControllerIdProvider { get; }
+    public ICoopFinalizer CoopFinalizer { get; }
+    public IModuleInfoProvider ModuleInfoProvider { get; }
+    public IModuleNameProvider ModuleNameProvider { get; }
+    public IHeroInterface HeroInterface { get; }
+    public IRegistryManager RegistryManager { get; }
+    public IPlayerManager PlayerManager { get; }
+    public IMapTimeTrackerInterface MapTimeTrackerInterface { get; }
+    public IJoinAttemptOverlay JoinAttemptOverlay { get; }
+    public JoinAttemptPresentation JoinAttempt { get; }
+    public IPatchFailureReport PatchFailureReport { get; }
+}

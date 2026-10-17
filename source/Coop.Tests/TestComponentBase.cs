@@ -1,0 +1,205 @@
+﻿using GameInterface.Services.UI.PlayerList;
+using Autofac;
+using Common.Messaging;
+using Common.Network;
+using Common.Serialization;
+using Common.Tests.Utils;
+using Coop.Core.Server.Connections;
+using Coop.Core.Server.Services.Kingdoms;
+using Coop.Core.Server.Services.MobileParties;
+using Coop.Tests.Mocks;
+using GameInterface.AutoSync;
+using GameInterface.Configuration;
+using GameInterface.CoopSessionData;
+using GameInterface.Registry;
+using GameInterface.Registry.Auto;
+using GameInterface.Services.CampaignService.Interfaces;
+using GameInterface.Services.Chat;
+using GameInterface.Services.Voice;
+using GameInterface.Services.GameState.Interfaces;
+using GameInterface.Services.Heroes.Interaces;
+using GameInterface.Services.MapTracking;
+using GameInterface.Services.Heroes.Interfaces;
+using GameInterface.Services.Issues.Framework.Interface;
+using GameInterface.Services.Kingdoms;
+using GameInterface.Services.Locations.Hosting;
+using GameInterface.Services.MapEvents;
+using GameInterface.Services.MobileParties;
+using GameInterface.Services.MapEvents.Initialization;
+using GameInterface.Services.MapEvents.Interfaces;
+using GameInterface.Services.MapEvents.Participation;
+using GameInterface.Services.MapEvents.TroopSupply;
+using GameInterface.Services.MobileParties.Data;
+using GameInterface.Services.MobileParties.Interfaces;
+using GameInterface.Services.Modules;
+using GameInterface.Services.Modules.Validators;
+using GameInterface.Services.ObjectManager;
+using GameInterface.Services.Players;
+using GameInterface.Services.Players.Data;
+using GameInterface.Services.Save.Interfaces;
+using GameInterface.Services.Settlements.Interfaces;
+using GameInterface.Services.SiegeEvents;
+using GameInterface.Services.SiegeEvents.Interfaces;
+using GameInterface.Services.Time.Interfaces;
+using GameInterface.Services.TroopRosters.Interfaces;
+using GameInterface.Services.UI;
+using GameInterface.Services.UI.Interfaces;
+using GameInterface.Services.UI.JoinCancel;
+using GameInterface.Services.Villages.Interfaces;
+using Moq;
+using Serilog;
+using System;
+using Xunit.Abstractions;
+using IGameInterface = GameInterface.IGameInterface;
+
+namespace Coop.Tests;
+
+internal abstract class TestComponentBase
+{
+    public ITestOutputHelper Output { get; }
+
+    public TestMessageBroker TestMessageBroker { get; protected set; }
+    public TestNetwork TestNetwork { get; protected set; }
+    public IContainer Container { get; protected set; }
+
+    protected TestComponentBase(ITestOutputHelper output)
+    {
+        Output = output;
+    }
+
+    /// <summary>
+    /// Builds container and assigns class properties for ease of use in testing
+    /// </summary>
+    /// <param name="builder">Container builder</param>
+    /// <returns>Container with all common types registered</returns>
+    protected IContainer BuildContainer(ContainerBuilder builder)
+    {
+        RegisterCommonTypes(builder);
+
+        var container = builder.Build();
+
+        TestMessageBroker = container.Resolve<TestMessageBroker>();
+        TestNetwork = container.Resolve<TestNetwork>();
+        Container = container;
+
+        TestMessageBroker.Messages.Clear();
+        TestNetwork.Clear();
+
+        return container;
+    }
+
+    private ContainerBuilder RegisterCommonTypes(ContainerBuilder builder)
+    {
+        builder.RegisterType<SerializableTypeMapper>().As<ISerializableTypeMapper>().InstancePerLifetimeScope();
+        builder.RegisterType<ProtoBufSerializer>().As<ICommonSerializer>().InstancePerLifetimeScope();
+        builder.RegisterType<TestMessageBroker>().AsSelf().As<IMessageBroker>().InstancePerLifetimeScope();
+        builder.RegisterType<TestNetwork>().AsSelf().As<INetwork>().InstancePerLifetimeScope();
+        builder.RegisterType<ModuleValidator>().As<IModuleValidator>().SingleInstance();
+
+
+        builder.RegisterType<ObjectManager>().As<IObjectManager>().InstancePerLifetimeScope();
+        builder.RegisterType<MobilePartyBehaviorSnapshot>().As<IMobilePartyBehaviorSnapshot>().InstancePerDependency();
+        RegisterMock<IPartyBehaviorWireMapper>(builder);
+        builder.RegisterType<RegistryCollection>().As<IRegistryCollection>().InstancePerLifetimeScope();
+        builder.RegisterType<KingdomCreationSettlementTracker>().As<IKingdomCreationSettlementTracker>().InstancePerLifetimeScope();
+        builder.RegisterType<KingdomDecisionDataConverter>().As<IKingdomDecisionDataConverter>().InstancePerLifetimeScope();
+
+        RegisterMock<ILogger>(builder);
+        RegisterMock<IGameInterface>(builder);
+        var modConfig = new Mock<IModConfig>();
+        modConfig.SetupGet(config => config.Data).Returns(new ModConfigData());
+        builder.RegisterInstance(modConfig).AsSelf().SingleInstance();
+        builder.RegisterInstance(modConfig.Object).As<IModConfig>().SingleInstance();
+        RegisterMock<IAutoSyncPatchCollector>(builder);
+        RegisterMock<IHeroInterface>(builder);
+        RegisterMock<IModuleInfoProvider>(builder);
+        RegisterMock<IModuleNameProvider>(builder);
+        RegisterMock<IRegistryManager>(builder);
+        RegisterMock<IMapEventLoadCleaner>(builder);
+        RegisterMock<IEmptyLordPartyResetter>(builder);
+        RegisterMock<IHideoutResultEncounter>(builder);
+        RegisterPlayerManagerMock(builder);
+        RegisterMock<IPlayerPartyRestorer>(builder);
+        RegisterMock<IPlayerCreationRollback>(builder);
+        RegisterMock<IPlayerMapTracking>(builder);
+        RegisterMock<ITimeControlInterface>(builder);
+        RegisterMock<ITroopRosterInterface>(builder);
+        RegisterMock<IMapTimeTrackerInterface>(builder);
+        RegisterMock<IJoinCampaignBaselineSender>(builder);
+        RegisterMock<IJoinCampaignKingdomBaseLineSender>(builder);
+        RegisterMock<ILoadingInterface>(builder);
+        RegisterMock<IJoinAttemptOverlay>(builder);
+        RegisterMock<ICoopSessionProvider>(builder);
+        RegisterMock<ITroopRosterInterface>(builder);
+        RegisterMock<IMobilePartyInterface>(builder);
+        RegisterMock<IGameStateInterface>(builder);
+        RegisterMock<ISettlementInterface>(builder);
+        RegisterMock<ISiegeEventInterface>(builder);
+        RegisterMock<ISiegeBreakOut>(builder);
+        RegisterMock<IAttachmentIdMapper>(builder);
+        RegisterMock<IAutoRegistryFactory>(builder);
+        RegisterMock<IBattleTroopReserveBuilder>(builder);
+        RegisterMock<IMapEventInitializationBarrier>(builder);
+        RegisterMock<IConnectedPlayerCountService>(builder);
+        RegisterMock<IChatService>(builder);
+        RegisterMock<IPlayerListService>(builder);
+        RegisterMock<IPlayerActivityReader>(builder);
+        RegisterMock<IPlatformDisplayNameProvider>(builder);
+        RegisterMock<IVoiceClient>(builder);
+        RegisterMock<IChatPlayerNameResolver>(builder);
+        // BattleHostHandler (MissionModule, auto-activated) needs the registry and the troop ledger,
+        // which the real containers get from GameInterfaceModule — not loaded here.
+        RegisterMock<IBattleHostRegistry>(builder);
+        RegisterMock<IBattleTroopLedger>(builder);
+        RegisterMock<IRetreatedMapEventPartyTracker>(builder);
+        // LocationHostHandler (MissionModule, auto-activated) needs its registry the same way.
+        RegisterMock<ILocationHostRegistry>(builder);
+        RegisterMock<IRaidAiInterventionConfigInterface>(builder);
+        RegisterMock<ITacticalUnitSymbolsConfigInterface>(builder);
+        RegisterMock<IVillageHostileActionInterface>(builder);
+        RegisterMock<IIssueOwnershipRegistry>(builder);
+        RegisterMock<IServerOptionsProvider>(builder);
+        RegisterMock<ISteamBanList>(builder);
+        RegisterMock<ISaveNotificationInterface>(builder);
+
+        // ISaveInterface is consumed by TransferSaveState's constructor, which packages a save the
+        // moment the state is entered. Give it a non-null default so simply entering the state does
+        // not NRE; tests that assert on the transferred save re-stub the return value.
+        var saveInterfaceMock = new Mock<ISaveInterface>();
+        saveInterfaceMock.Setup(m => m.SaveCurrentGame())
+            .Returns(new SaveResults(true, Array.Empty<byte>(), "test-campaign"));
+        builder.RegisterInstance(saveInterfaceMock).AsSelf().SingleInstance();
+        builder.RegisterInstance(saveInterfaceMock.Object).As<ISaveInterface>().SingleInstance();
+
+        return builder;
+    }
+
+    protected void RegisterMock<T>(ContainerBuilder builder) where T : class
+    {
+        var mock = new Mock<T>();
+        builder.RegisterInstance(mock).AsSelf().SingleInstance();
+        builder.RegisterInstance(mock.Object).As<T>().SingleInstance();
+    }
+
+    /// <summary>
+    /// The connection states replay the existing players to a joining peer, iterating
+    /// <see cref="IPlayerManager.Players"/>. Default it to empty so simply entering those states does not
+    /// NRE; tests that exercise the replay re-stub it.
+    /// </summary>
+    private void RegisterPlayerManagerMock(ContainerBuilder builder)
+    {
+        var mock = new Mock<IPlayerManager>();
+        mock.Setup(m => m.Players).Returns(Array.Empty<Player>());
+        builder.RegisterInstance(mock).AsSelf().SingleInstance();
+        builder.RegisterInstance(mock.Object).As<IPlayerManager>().SingleInstance();
+    }
+
+    private IContainer SetupContainerProvider(ContainerBuilder builder)
+    {
+        var container = builder.Build();
+
+        global::GameInterface.ContainerProvider.SetContainer(container);
+
+        return container;
+    }
+}

@@ -1,0 +1,484 @@
+﻿using Common;
+using Common.Messaging;
+using GameInterface.Services.MapEvents;
+using GameInterface.Services.MapEvents.Messages;
+using Missions.Messages;
+using System;
+using System.Collections.Generic;
+using TaleWorlds.Core;
+using TaleWorlds.Engine;
+using TaleWorlds.MountAndBlade;
+using TaleWorlds.ObjectSystem;
+
+namespace Missions.Battles;
+
+/// <summary>
+/// Replays the machine simulator's siege fire and ram animations on the other clients.
+/// Replayed projectiles are cosmetic; routed blows apply damage on each victim's owner.
+/// </summary>
+public interface ISiegeWeaponFireReplicator : IDisposable
+{
+    void Tick(float dt);
+}
+
+/// <inheritdoc cref="ISiegeWeaponFireReplicator"/>
+public class SiegeWeaponFireReplicator : ISiegeWeaponFireReplicator
+{
+    private bool disposed;
+    private readonly IBattleNetwork network;
+    private readonly IMessageBroker messageBroker;
+    private readonly INetworkAgentRegistry registry;
+    private readonly IBattleSession session;
+    private readonly ISiegeMachineStateReplicator machineState;
+    private readonly ISiegeGateHitApplier gateHitApplier;
+    private readonly IHostEpochPolicy hostEpochPolicy;
+    private readonly Dictionary<int, List<NetworkSiegeWeaponFired>> pendingNetworkFires =
+        new Dictionary<int, List<NetworkSiegeWeaponFired>>();
+
+    private readonly Dictionary<int, List<NetworkGateHit>> pendingGateHits =
+        new Dictionary<int, List<NetworkGateHit>>();
+
+    public SiegeWeaponFireReplicator(
+        IBattleNetwork network,
+        IMessageBroker messageBroker,
+        INetworkAgentRegistry registry,
+        IBattleSession session,
+        ISiegeMachineStateReplicator machineState,
+        ISiegeGateHitApplier gateHitApplier,
+        IHostEpochPolicy hostEpochPolicy)
+    {
+        this.network = network;
+        this.messageBroker = messageBroker;
+        this.registry = registry;
+        this.session = session;
+        this.machineState = machineState;
+        this.gateHitApplier = gateHitApplier;
+        this.hostEpochPolicy = hostEpochPolicy;
+
+        machineState.AuthorityChanged += Handle_AuthorityChanged;
+        messageBroker.Subscribe<SiegeWeaponFired>(Handle_LocalFire);
+        messageBroker.Subscribe<NetworkSiegeWeaponFired>(Handle_NetworkFire);
+        messageBroker.Subscribe<RamHitStarted>(Handle_LocalRamHit);
+        messageBroker.Subscribe<NetworkRamHit>(Handle_NetworkRamHit);
+        messageBroker.Subscribe<GateHitByRam>(Handle_LocalGateHit);
+        messageBroker.Subscribe<NetworkGateHit>(Handle_NetworkGateHit);
+    }
+
+    public void Tick(float dt)
+    {
+        _ = dt;
+        if (disposed || Mission.Current == null)
+            return;
+
+        var machineIds = new List<int>(pendingNetworkFires.Keys);
+        foreach (int machineId in machineIds)
+            DrainPendingNetworkFires(machineId);
+
+        var ramIds = new List<int>(pendingGateHits.Keys);
+        foreach (int ramId in ramIds)
+            DrainPendingGateHits(ramId);
+    }
+
+    public void Dispose()
+    {
+        if (disposed) return;
+        disposed = true;
+        machineState.AuthorityChanged -= Handle_AuthorityChanged;
+        messageBroker.Unsubscribe<SiegeWeaponFired>(Handle_LocalFire);
+        messageBroker.Unsubscribe<NetworkSiegeWeaponFired>(Handle_NetworkFire);
+        messageBroker.Unsubscribe<RamHitStarted>(Handle_LocalRamHit);
+        messageBroker.Unsubscribe<NetworkRamHit>(Handle_NetworkRamHit);
+        messageBroker.Unsubscribe<GateHitByRam>(Handle_LocalGateHit);
+        messageBroker.Unsubscribe<NetworkGateHit>(Handle_NetworkGateHit);
+        pendingNetworkFires.Clear();
+        pendingGateHits.Clear();
+    }
+
+    // [Owner] one of our simulated siege machines fired — broadcast the resolved launch so the rest replay it.
+    private void Handle_LocalFire(MessagePayload<SiegeWeaponFired> payload)
+    {
+        var fire = payload.What;
+        if (!machineState.TryGetMachineAuthority(
+                fire.Weapon.Id.Id,
+                out var controllerId,
+                out var hostEpoch,
+                out var authorityRevision)
+            || controllerId != session.OwnControllerId)
+        {
+            return;
+        }
+
+        Guid shooterId = Guid.Empty;
+        if (fire.Shooter != null && registry.TryGetAgentInfo(fire.Shooter, out var info))
+            shooterId = info.AgentId;
+
+        network.SendAll(new NetworkSiegeWeaponFired(
+            fire.Weapon.Id.Id,
+            shooterId,
+            fire.Position,
+            fire.Direction,
+            fire.Orientation,
+            fire.BaseSpeed,
+            fire.Speed,
+            fire.MissileItem?.StringId,
+            controllerId,
+            hostEpoch,
+            authorityRevision));
+    }
+
+    // Another client's simulated siege machine fired — swing the arm and throw a cosmetic stone.
+    private void Handle_NetworkFire(MessagePayload<NetworkSiegeWeaponFired> payload)
+    {
+        var msg = payload.What;
+
+        GameThread.RunSafe(() =>
+        {
+            Handle_NetworkFireOnGameThread(msg);
+        });
+    }
+
+    private void Handle_NetworkFireOnGameThread(NetworkSiegeWeaponFired msg)
+    {
+        if (disposed || Mission.Current == null) return;
+        if (hostEpochPolicy.IsStale(msg.HostEpoch, session.HostEpoch)) return;
+        if (!machineState.TryGetMachineAuthority(
+                msg.MachineId,
+                out var controllerId,
+                out var hostEpoch,
+                out var authorityRevision))
+        {
+            BufferNetworkFire(msg);
+            return;
+        }
+
+        int authorityOrder = CompareMachineAuthority(
+            msg.SenderControllerId,
+            msg.HostEpoch,
+            msg.AuthorityRevision,
+            controllerId,
+            hostEpoch,
+            authorityRevision);
+        if (authorityOrder == 1)
+        {
+            BufferNetworkFire(msg);
+            return;
+        }
+
+        if (authorityOrder != 0)
+            return;
+
+        // The machine's simulator fired natively; everyone else replays it.
+        if (SiegeMissionAuthorityGate.IsMachineSimulatedLocally(msg.MachineId)) return;
+
+        var weapon = FindMissionObject<RangedSiegeWeapon>(msg.MachineId);
+        if (weapon == null)
+        {
+            BufferNetworkFire(msg);
+            return;
+        }
+
+        if (!TrySpawnProjectile(weapon, msg))
+        {
+            BufferNetworkFire(msg);
+            return;
+        }
+
+        PlayFireAnimation(weapon);
+    }
+
+    private void BufferNetworkFire(NetworkSiegeWeaponFired msg)
+    {
+        if (!pendingNetworkFires.TryGetValue(msg.MachineId, out var pending))
+        {
+            pending = new List<NetworkSiegeWeaponFired>();
+            pendingNetworkFires[msg.MachineId] = pending;
+        }
+
+        pending.Add(msg);
+    }
+
+    private void Handle_AuthorityChanged(int machineId)
+    {
+        DrainPendingNetworkFires(machineId);
+        DrainPendingGateHits(machineId);
+    }
+
+    private void DrainPendingNetworkFires(int machineId)
+    {
+        if (disposed || Mission.Current == null
+            || !machineState.TryGetMachineAuthority(
+                machineId,
+                out string controllerId,
+                out int hostEpoch,
+                out int authorityRevision)
+            || !pendingNetworkFires.TryGetValue(machineId, out var pending))
+        {
+            return;
+        }
+
+        pendingNetworkFires.Remove(machineId);
+        foreach (var msg in pending)
+        {
+            int authorityOrder = CompareMachineAuthority(
+                msg.SenderControllerId,
+                msg.HostEpoch,
+                msg.AuthorityRevision,
+                controllerId,
+                hostEpoch,
+                authorityRevision);
+            if (authorityOrder == 1)
+            {
+                BufferNetworkFire(msg);
+                continue;
+            }
+
+            if (authorityOrder != 0)
+                continue;
+
+            NetworkSiegeWeaponFired pendingMessage = msg;
+            GameThread.RunSafe(() => Handle_NetworkFireOnGameThread(pendingMessage));
+        }
+    }
+
+    private static T FindMissionObject<T>(int id) where T : MissionObject
+    {
+        foreach (var missionObject in Mission.Current.MissionObjects)
+        {
+            if (missionObject is T match && match.Id.Id == id) return match;
+        }
+        return null;
+    }
+
+    // Vanilla plays FireAnimations on the machine's skeleton owners when it enters WaitingBeforeProjectileLeaving
+    // (RangedSiegeWeapon.OnRangedSiegeWeaponStateChange); a peer never reaches that state, so drive it directly.
+    private static void PlayFireAnimation(RangedSiegeWeapon weapon)
+    {
+        var skeletons = weapon.SkeletonOwnerObjects;
+        var animations = weapon.FireAnimations;
+        if (skeletons == null || animations == null) return;
+
+        for (int i = 0; i < skeletons.Length && i < animations.Length; i++)
+        {
+            if (skeletons[i] == null || string.IsNullOrEmpty(animations[i])) continue;
+            skeletons[i].SetAnimationAtChannelSynched(animations[i], 0);
+        }
+    }
+
+    private bool TrySpawnProjectile(RangedSiegeWeapon weapon, NetworkSiegeWeaponFired msg)
+    {
+        if (string.IsNullOrEmpty(msg.MissileItemId) || msg.ShooterAgentId == Guid.Empty) return true;
+
+        Agent shooter = null;
+        if (registry.TryGetAgentInfo(msg.ShooterAgentId, out var info) && info.Agent != null)
+        {
+            // Spawn only with a non-local shooter, so the cosmetic stone's blows are dropped (attacker not
+            // locally controlled) — the real damage arrives as routed blows and synced hit points.
+            if (registry.IsLocallyControlled(info.Agent)) return true;
+            shooter = info.Agent;
+        }
+        else
+        {
+            // The simulator's crew agent may not exist here (an unattributed puppet); the stone must still
+            // fly. Any inert puppet keeps the blow-drop guarantee — it keys on Controller.None, not on the
+            // shooter's identity. AddCustomMissile cannot take a null shooter.
+            shooter = FindStandInShooter();
+            if (shooter == null) return false;
+        }
+
+        var missileItem = MBObjectManager.Instance.GetObject<ItemObject>(msg.MissileItemId);
+        if (missileItem == null) return true;
+
+        // Ammo count 1 matches the simulator's own launch exactly (physics-inert, cosmetic parity).
+        var missileWeapon = new MissionWeapon(missileItem, null, null, 1);
+        Mission.Current.AddCustomMissile(shooter, missileWeapon, msg.Position, msg.Direction, msg.Orientation, msg.BaseSpeed, msg.Speed, addRigidBody: false, weapon);
+        return true;
+    }
+
+    private static Agent FindStandInShooter()
+    {
+        foreach (var agent in Mission.Current.Agents)
+        {
+            if (agent.IsHuman && agent.IsActive() && agent.Controller == AgentControllerType.None) return agent;
+        }
+
+        return null;
+    }
+
+    // [Simulator] our ram struck the gate — broadcast so everyone else plays the swing (their unmanned ram
+    // never strikes).
+    private void Handle_LocalRamHit(MessagePayload<RamHitStarted> payload)
+    {
+        var hit = payload.What;
+        network.SendAll(new NetworkRamHit(hit.Ram.Id.Id, hit.PowerStage, hit.Progress));
+    }
+
+    // The simulator's ram struck — play the ram body swing animation. Rams are crew-grantable, so the
+    // gate is per-machine: the host must replay a client-simulated ram's swing too.
+    private void Handle_NetworkRamHit(MessagePayload<NetworkRamHit> payload)
+    {
+        var msg = payload.What;
+
+        GameThread.RunSafe(() =>
+        {
+            if (disposed || Mission.Current == null) return;
+            if (SiegeMissionAuthorityGate.IsMachineSimulatedLocally(msg.MachineId)) return;
+
+            var ram = FindMissionObject<BatteringRam>(msg.MachineId);
+            var body = ram?._batteringRamBody?.GetFirstScriptOfType<SynchedMissionObject>();
+            if (body == null) return;
+
+            // Mirror BatteringRam.StartHitAnimationWithProgress's body animation; the crew's pull animation
+            // rides the normal agent sync for the simulator's troops.
+            body.SetAnimationAtChannelSynched(RamHitAnimation(msg.PowerStage), 0);
+            if (msg.Progress > 0f) body.SetAnimationChannelParameterSynched(0, msg.Progress);
+        });
+    }
+
+    private static string RamHitAnimation(int powerStage) => powerStage switch
+    {
+        1 => "batteringram_fire_weak",
+        2 => "batteringram_fire",
+        _ => "batteringram_fire_weakest",
+    };
+
+    // [Simulator] our ram hit a gate — broadcast the hit with its damage so the host applies it to the
+    // authoritative gate and everyone replays the reaction.
+    private void Handle_LocalGateHit(MessagePayload<GateHitByRam> payload)
+    {
+        int ramId = payload.What.Ram.Id.Id;
+        if (!machineState.TryGetMachineAuthority(
+                ramId,
+                out var controllerId,
+                out var hostEpoch,
+                out var authorityRevision)
+            || controllerId != session.OwnControllerId)
+        {
+            return;
+        }
+
+        network.SendAll(new NetworkGateHit(
+            payload.What.Gate.Id.Id,
+            ramId,
+            payload.What.Damage,
+            controllerId,
+            hostEpoch,
+            authorityRevision));
+    }
+
+    // A granted ram strikes only on its simulator. The host applies the carried damage through vanilla
+    // TriggerOnHit even when a peer simulates the gate; the host snapshot carries hit points and destruction.
+    // Non-hosts replay only CastleGate.OnHitTaken's cosmetic reaction.
+    private void Handle_NetworkGateHit(MessagePayload<NetworkGateHit> payload)
+    {
+        GameThread.RunSafe(() => Handle_NetworkGateHitOnGameThread(payload.What));
+    }
+
+    private void Handle_NetworkGateHitOnGameThread(NetworkGateHit msg)
+    {
+        if (disposed || Mission.Current == null) return;
+        if (hostEpochPolicy.IsStale(msg.HostEpoch, session.HostEpoch)) return;
+        if (!machineState.TryGetMachineAuthority(
+                msg.RamId,
+                out var controllerId,
+                out var hostEpoch,
+                out var authorityRevision))
+        {
+            BufferGateHit(msg);
+            return;
+        }
+
+        int authorityOrder = CompareMachineAuthority(msg.SenderControllerId, msg.HostEpoch,
+            msg.AuthorityRevision, controllerId, hostEpoch, authorityRevision);
+        if (authorityOrder == 1)
+        {
+            BufferGateHit(msg);
+            return;
+        }
+        if (authorityOrder != 0) return;
+
+        bool ramSimulatedLocally = SiegeMissionAuthorityGate.IsMachineSimulatedLocally(msg.RamId);
+        if (ramSimulatedLocally) return;
+
+        if (!gateHitApplier.TryApply(msg, ShouldApplyHostGateDamage(session.IsLocalHost, ramSimulatedLocally)))
+        {
+            BufferGateHit(msg);
+        }
+    }
+
+    private void BufferGateHit(NetworkGateHit message)
+    {
+        if (!pendingGateHits.TryGetValue(message.RamId, out var pending))
+        {
+            pending = new List<NetworkGateHit>();
+            pendingGateHits[message.RamId] = pending;
+        }
+        pending.Add(message);
+    }
+
+    private void DrainPendingGateHits(int ramId)
+    {
+        if (disposed || Mission.Current == null || !pendingGateHits.TryGetValue(ramId, out var pending))
+            return;
+
+        pendingGateHits.Remove(ramId);
+        foreach (var message in pending)
+        {
+            // Retry only before native application; replay after a partial throw could duplicate damage.
+            GameThread.RunSafe(() => Handle_NetworkGateHitOnGameThread(message));
+        }
+    }
+
+    internal static bool ShouldApplyHostGateDamage(bool isLocalHost, bool ramSimulatedLocally)
+    {
+        return isLocalHost && !ramSimulatedLocally;
+    }
+
+    internal static bool IsCurrentGateHitProducer(
+        NetworkGateHit message,
+        string currentControllerId,
+        int currentHostEpoch,
+        int currentAuthorityRevision)
+    {
+        return IsCurrentMachineAuthority(
+            message.SenderControllerId,
+            message.HostEpoch,
+            message.AuthorityRevision,
+            currentControllerId,
+            currentHostEpoch,
+            currentAuthorityRevision);
+    }
+
+    internal static bool IsCurrentMachineAuthority(
+        string messageControllerId,
+        int messageHostEpoch,
+        int messageAuthorityRevision,
+        string currentControllerId,
+        int currentHostEpoch,
+        int currentAuthorityRevision)
+    {
+        return CompareMachineAuthority(
+            messageControllerId,
+            messageHostEpoch,
+            messageAuthorityRevision,
+            currentControllerId,
+            currentHostEpoch,
+            currentAuthorityRevision) == 0;
+    }
+
+    internal static int CompareMachineAuthority(
+        string messageControllerId,
+        int messageHostEpoch,
+        int messageAuthorityRevision,
+        string currentControllerId,
+        int currentHostEpoch,
+        int currentAuthorityRevision)
+    {
+        int hostEpochOrder = messageHostEpoch.CompareTo(currentHostEpoch);
+        if (hostEpochOrder != 0) return hostEpochOrder;
+
+        int revisionOrder = messageAuthorityRevision.CompareTo(currentAuthorityRevision);
+        if (revisionOrder != 0) return revisionOrder;
+
+        return messageControllerId == currentControllerId ? 0 : 2;
+    }
+}

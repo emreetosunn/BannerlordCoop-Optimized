@@ -1,0 +1,46 @@
+﻿using Autofac;
+using Common.Serialization;
+using GameInterface.Serialization;
+using GameInterface.Serialization.External;
+using GameInterface.Tests.Bootstrap.Modules;
+using TaleWorlds.Core;
+using Xunit;
+
+namespace GameInterface.Tests.Serialization.SerializerTests
+{
+    public class TradeItemComponentSerializationTest
+    {
+        ILifetimeScope container;
+        public TradeItemComponentSerializationTest()
+        {
+            container = SerializationTestContainer.BeginScope();
+        }
+
+        [Fact]
+        public void TradeItemComponent_Full_Serialization()
+        {
+            TradeItemComponent tradeItemComponent = new TradeItemComponent();
+            tradeItemComponent.MoraleBonus = 5;
+
+            var factory = container.Resolve<IBinaryPackageFactory>();
+            TradeItemComponentBinaryPackage package = new TradeItemComponentBinaryPackage(tradeItemComponent, factory);
+
+            package.Pack();
+
+            byte[] bytes = BinaryPackageSerializer.Serialize(package);
+                
+            Assert.NotEmpty(bytes);
+
+            object obj = BinaryPackageSerializer.Deserialize(bytes);
+
+            Assert.IsType<TradeItemComponentBinaryPackage>(obj);
+
+            TradeItemComponentBinaryPackage returnedPackage = (TradeItemComponentBinaryPackage)obj;
+
+            var deserializeFactory = container.Resolve<IBinaryPackageFactory>();
+            TradeItemComponent newtradeItemComponent = returnedPackage.Unpack<TradeItemComponent>(deserializeFactory);
+
+            Assert.Equal(tradeItemComponent.MoraleBonus, newtradeItemComponent.MoraleBonus);
+        }
+    }
+}

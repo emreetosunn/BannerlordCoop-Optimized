@@ -1,0 +1,2778 @@
+﻿using Common.Commands;
+using Common;
+using Common.Logging;
+using Serilog;
+using GameInterface;
+using GameInterface.Registry.Auto;
+using GameInterface.Services.MapEvents;
+using GameInterface.Services.MapEvents.Commands;
+using GameInterface.Services.MapEvents.TroopSupply;
+using GameInterface.Services.ObjectManager;
+using Missions.Agents.Packets;
+using Newtonsoft.Json;
+#if DEBUG
+using Missions.Diagnostics;
+using Missions.Messages;
+using Common.Network;
+using GameInterface.Services.Players;
+using LiteNetLib;
+#endif
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.Party;
+using TaleWorlds.Core;
+using TaleWorlds.Engine;
+using TaleWorlds.Library;
+using TaleWorlds.MountAndBlade;
+using TaleWorlds.MountAndBlade.View.Screens;
+using TaleWorlds.ScreenSystem;
+
+namespace Missions.Battles;
+
+/// <summary>Reports state needed to verify co-op battle synchronization.</summary>
+internal static class BattleDebugCommands
+{
+    private static CoopCommandResult Succeeded(string output) =>
+        new CoopCommandResult(true, output);
+
+    private static CoopCommandResult Failed(string output) =>
+        new CoopCommandResult(false, output, "command_failed");
+
+#if DEBUG
+    public sealed class CancelFixtureMissionReadyCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+        public string Name => "cancel_fixture_mission_ready";
+        public string Description => "Clears the owned readiness delay during fixture teardown.";
+        public CoopCommandSide Side => CoopCommandSide.Client;
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("map_event_id", "The fixture's siege assault.")
+        };
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            return ModInformation.IsClient && args.Count == 1 &&
+                ContainerProvider.TryResolve<BattleHostHandler>(out var handler) &&
+                handler.CancelFixtureMissionReady(args[0])
+                ? Succeeded("Fixture mission readiness delay cleared.")
+                : Failed("The readiness delay belongs to another assault.");
+        }
+    }
+
+    public sealed class DeferFixtureMissionReadyCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+        public string Name => "defer_fixture_mission_ready";
+        public string Description => "Defers this client's readiness until the named peer is elected at epoch one.";
+        public CoopCommandSide Side => CoopCommandSide.Client;
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("map_event_id", "Current replicated siege assault."),
+            new ExpectedArgs("host_controller_id", "Connected participant that must become host first.")
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            var mapEvent = MobileParty.MainParty?.MapEvent;
+            if (ModInformation.IsServer || args.Count != 2 || Mission.Current != null ||
+                mapEvent?.IsSiegeAssault != true ||
+                !ContainerProvider.TryResolve<IObjectManager>(out var objects) ||
+                !objects.TryGetId(mapEvent, out string mapEventId) || mapEventId != args[0] ||
+                !ContainerProvider.TryResolve<IPlayerManager>(out var players) ||
+                !players.TryGetPlayer(args[1], out var player) ||
+                !objects.TryGetObject<MobileParty>(player.MobilePartyId, out var party) ||
+                !ReferenceEquals(party.MapEvent, mapEvent) ||
+                !ContainerProvider.TryResolve<BattleHostHandler>(out var handler) ||
+                !handler.DeferFixtureMissionReady(mapEventId, args[1]))
+                return Failed("A fresh siege assault with a different participating host is required.");
+            return Succeeded($"Mission readiness deferred for {mapEventId} until {args[1]} is elected at epoch 1.");
+        }
+    }
+#endif
+
+#if DEBUG
+    public sealed class SiegeInteractionObserveCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+        public string Name => "siege_interaction_observe";
+        public string Description => "Reads native focus, use and input lifecycle on this client.";
+        public CoopCommandSide Side => CoopCommandSide.Client;
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("agent_id", "Optional exact registered agent id to observe on this client.", false),
+            new ExpectedArgs("machine_id", "Optional exact current mission machine id to read without staging it.", false)
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            Guid? agentId = null;
+            int? machineId = null;
+            if (args.Count > 2) return Failed("Expected a registered agent id and optional machine id.");
+            if (args.Count >= 1)
+            {
+                if (!Guid.TryParseExact(args[0], "N", out var parsedId) || parsedId == Guid.Empty)
+                    return Failed("Expected a registered agent id in N format.");
+                agentId = parsedId;
+            }
+            if (args.Count == 2)
+            {
+                if (!int.TryParse(args[1], out int parsedMachineId) || parsedMachineId <= 0)
+                    return Failed("Expected a positive current mission machine id.");
+                machineId = parsedMachineId;
+            }
+            var observer = Mission.Current?.GetMissionBehavior<SiegeInteractionDebugBehavior>();
+            if (ModInformation.IsServer || observer == null)
+                return Failed("A rendered client battle with its DEBUG observer is required.");
+            return Succeeded("LIVE_TEST_JSON=" + JsonConvert.SerializeObject(observer.Observe(agentId, machineId)));
+        }
+    }
+
+    public sealed class SiegeInteractionTargetCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+        public string Name => "siege_interaction_target";
+        public string Description => "Finds an existing visible machine without changing its eligibility.";
+        public CoopCommandSide Side => CoopCommandSide.Client;
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("type_name", "Exact concrete type from dump_machines all."),
+            new ExpectedArgs("ladder_action", "Optional exact ladder action: fork or lift.", false)
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            var mission = Mission.Current;
+            if (ModInformation.IsServer || mission?.IsSiegeBattle != true || args.Count < 1 || args.Count > 2 ||
+                (args.Count == 2 && (args[0] != nameof(SiegeLadder) || (args[1] != "fork" && args[1] != "lift"))))
+                return Failed("A client siege mission and a concrete machine type are required.");
+            var agent = mission.MainAgent;
+            var target = mission.MissionObjects.OfType<UsableMachine>()
+                .Where(candidate => candidate.GetType().Name == args[0] &&
+                    candidate.GameEntity.IsVisibleIncludeParents() && candidate.StandingPoints.Count > 0)
+                .OrderBy(candidate => candidate.Id.Id)
+                .Take(args.Count == 2 ? int.MaxValue : 1)
+                .SelectMany(machine => machine.StandingPoints.Select(point => new { machine, point }))
+                .FirstOrDefault(pair =>
+                {
+                    var machine = pair.machine;
+                    var candidate = pair.point;
+                    if (args.Count == 2 && machine is SiegeLadder ladder &&
+                        !(args[1] == "fork" ? ReferenceEquals(candidate, ladder._forkPickUpStandingPoint) :
+                            ladder._attackerStandingPoints.Contains(candidate))) return false;
+                    return agent != null && !candidate.IsDeactivated && !candidate.IsDisabledForPlayers &&
+                        !candidate.IsDisabledForAgent(agent) && (!candidate.HasUser || candidate.HasAIUser) &&
+                        (machine is RangedSiegeWeapon ranged ? ReferenceEquals(candidate, ranged.PilotStandingPoint) :
+                            !(machine is StonePile stones) || stones.AmmoPickUpPoints.Contains(candidate));
+                });
+            if (target == null) return Failed("The current machine has no active vacant player standing point for the requested action.");
+            return Succeeded("LIVE_TEST_JSON=" + JsonConvert.SerializeObject(new
+            {
+                success = true, id = target.machine.Id.Id, type = target.machine.GetType().Name,
+                standingPointIndex = target.machine.StandingPoints.ToList().IndexOf(target.point),
+                standingPointId = target.point.Id.Id,
+                standingPointCount = target.machine.StandingPoints.Count,
+                ladderAction = args.Count == 2 ? args[1] : null
+            }));
+        }
+    }
+
+    public sealed class SiegeInteractionRequestCoopCommand : ICoopCommand
+    {
+        private readonly IPlayerManager players;
+        private readonly IObjectManager objects;
+        private readonly INetwork network;
+
+        public string Prefix => "coop.debug.battle";
+        public string Name => "siege_interaction_request";
+        public string Description => "Routes one ordinary use press to a defender's real client.";
+        public CoopCommandSide Side => CoopCommandSide.Server;
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("controller_id", "Connected defender controller."),
+            new ExpectedArgs("request_id", "Unique native input request."),
+            new ExpectedArgs("machine_id", "Native mission object id from dump_machines."),
+            new ExpectedArgs("action", "capture, prepare-arrows, dismount, stage, approach, aim, watch, use, fire, attack, stop or restore."),
+            new ExpectedArgs("standing_point", "Existing standing point index.", isRequired: false)
+        };
+
+        public SiegeInteractionRequestCoopCommand(IPlayerManager players, IObjectManager objects,
+            INetwork network)
+        {
+            this.players = players;
+            this.objects = objects;
+            this.network = network;
+        }
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (ModInformation.IsClient) return Failed("Run this command on the server.");
+            if ((args.Count != 4 && args.Count != 5) || string.IsNullOrWhiteSpace(args[1]) ||
+                !int.TryParse(args[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out int machineId))
+                return Failed("Expected controller_id, unique request_id, machine_id, action and optional standing_point.");
+            int standingPoint = 0;
+            if ((args[3] != "capture" && args[3] != "dismount" && args[3] != "stage" && args[3] != "approach" && args[3] != "aim" && args[3] != "watch" && args[3] != "arm-use" && args[3] != "arm-stop" && args[3] != "use" &&
+                 args[3] != "fire" && args[3] != "attack" && args[3] != "stop" && args[3] != "restore" &&
+                 args[3] != "handler-use" && args[3] != "handler-stop" && args[3] != "handler-fire" && args[3] != "handler-reload" &&
+                 args[3] != "prepare-arrows" && args[3] != "handler-throw") ||
+                (args.Count == 5 && !int.TryParse(args[4], out standingPoint)))
+                return Failed("Invalid action or standing point.");
+            if (!players.TryGetPlayer(args[0], out var player) ||
+                !players.TryGetPeer(args[0], out var peer) || peer == null || peer.ConnectionState != ConnectionState.Connected ||
+                !players.TryGetPlayer(peer, out var boundPlayer) || !ReferenceEquals(player, boundPlayer) ||
+                !objects.TryGetObject<MobileParty>(player.MobilePartyId, out var party) ||
+                party.MapEvent?.IsSiegeAssault != true || party.MapEventSide?.MissionSide != BattleSideEnum.Defender ||
+                !objects.TryGetId(party.MapEvent, out string mapEventId))
+                return Failed("The controller must be a connected defender in the active siege assault.");
+            network.Send(peer, new NetworkSiegeInteractionDebugRequest(mapEventId, args[0], args[1], machineId, args[3], standingPoint));
+            return Succeeded("LIVE_TEST_JSON=" + JsonConvert.SerializeObject(new
+            {
+                success = true, status = "routed_outcome_pending", controllerId = args[0],
+                requestId = args[1], mapEventId, machineId
+            }));
+        }
+    }
+
+    public sealed class DefenderMissionAcknowledgementCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+        public string Name => "defender_mission_ack";
+        public string Description => "Reports committed defender siege mission readiness.";
+        public CoopCommandSide Side => CoopCommandSide.Client;
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args) =>
+            Succeeded(DefenderMissionAcknowledgement(args.ToList()));
+    }
+
+    private static string DefenderMissionAcknowledgement(List<string> args)
+    {
+        if (args.Count != 0)
+        {
+            return "Usage: coop.debug.battle.defender_mission_ack";
+        }
+
+        var mission = Mission.Current;
+        var controller = mission?.GetMissionBehavior<CoopBattleController>();
+        var playerTeam = mission?.PlayerTeam;
+        var localMainAgent = Agent.Main;
+        bool missionActive = mission != null;
+        bool activeCoopSiegeAssault = missionActive && controller != null &&
+            MobileParty.MainParty?.MapEvent?.IsSiegeAssault == true;
+        bool localMainAgentActive = localMainAgent != null && localMainAgent.IsActive() &&
+            localMainAgent.Mission == mission && localMainAgent.Team == playerTeam;
+        // The commit latch survives removal of the native deployment controller.
+        bool deploymentCommitted = controller?.Deployment.IsCommitted == true;
+        bool controllerReady = controller?.Session.HasInstance == true && controller.Deployment.IsActivated;
+        BattleSideEnum battleSide = playerTeam?.Side ?? BattleSideEnum.None;
+        bool success = DefenderMissionAcknowledgementContract.IsReady(
+            ModInformation.IsClient,
+            missionActive,
+            activeCoopSiegeAssault,
+            battleSide,
+            localMainAgentActive,
+            deploymentCommitted,
+            controllerReady);
+
+        return "LIVE_TEST_JSON=" + JsonConvert.SerializeObject(new
+        {
+            success,
+            role = ModInformation.IsServer ? "server" : "client",
+            missionActive,
+            missionKind = activeCoopSiegeAssault ? "siege-assault" : "none",
+            activeCoopSiegeAssault,
+            battleSide = battleSide.ToString(),
+            localMainAgent = localMainAgentActive,
+            deploymentCommitted,
+            controllerReady,
+            sessionId = controller?.Session.InstanceId
+        });
+    }
+#endif
+
+    private static readonly Dictionary<int, Vec3> EnemyPositions = new Dictionary<int, Vec3>();
+    private static int ownDamageEvents;
+    private static readonly Dictionary<Agent, AgentControllerType> CavalryControllers =
+        new Dictionary<Agent, AgentControllerType>();
+    private const int MaximumMountPoseSamples = 120;
+    private static readonly List<MountPoseSample> MountPoseSamples =
+        new List<MountPoseSample>();
+    private static Mission observedMission;
+    private static Camera ladderCamera;
+    private static Camera mountCamera;
+    private static MatrixFrame mountCameraLocalFrame;
+    private static Agent focusedMount;
+    private static Guid focusedMountId;
+    private static Agent capturedMount;
+    private static Guid capturedMountId;
+    private static float mountPoseCaptureStartTime;
+    private static BattleDebugTickBehavior battleDebugTickBehavior;
+
+    internal sealed class BattleDebugTickBehavior : MissionBehavior
+    {
+#if DEBUG
+        private static readonly ILogger Logger = LogManager.GetLogger<BattleDebugTickBehavior>();
+        private readonly Dictionary<Agent, OwnedAgentMovementDriveState> ownedAgentMovementDriveStates =
+            new Dictionary<Agent, OwnedAgentMovementDriveState>();
+        private Mission ownedAgentMovementDriveMission;
+        private INetworkAgentRegistry movementDriveRegistry;
+        private IBattleSession movementDriveSession;
+        private string movementDriveInstanceId;
+        private string movementDriveControllerId;
+        private int movementDriveHostEpoch;
+        private float ownedAgentMovementDriveEndTime;
+        private int invalidatedMovementDriveAgents;
+        private int failedMovementDriveAgents;
+        private int restoredMovementDriveAgents;
+
+        internal int OwnedAgentMovementDriveAgentCount => ownedAgentMovementDriveStates.Count;
+        internal string[] OwnedAgentMovementDriveAgentIds => ownedAgentMovementDriveStates.Values
+            .Select(state => state.AgentId.ToString("D")).OrderBy(id => id).ToArray();
+#endif
+
+        public override MissionBehaviorType BehaviorType => MissionBehaviorType.Other;
+
+#if DEBUG
+        public void BeginOwnedAgentMovementDrive(
+            Mission mission,
+            INetworkAgentRegistry registry,
+            IBattleSession session,
+            IEnumerable<CoopAgentInfo> agents,
+            float durationSeconds)
+        {
+            CancelOwnedAgentMovementDrive();
+            invalidatedMovementDriveAgents = 0;
+            failedMovementDriveAgents = 0;
+            restoredMovementDriveAgents = 0;
+            if (mission == null || registry == null || session == null || !session.HasInstance)
+                return;
+
+            ownedAgentMovementDriveMission = mission;
+            movementDriveRegistry = registry;
+            movementDriveSession = session;
+            movementDriveInstanceId = session.InstanceId;
+            movementDriveControllerId = session.OwnControllerId;
+            movementDriveHostEpoch = session.HostEpoch;
+            ownedAgentMovementDriveEndTime = mission.CurrentTime + durationSeconds;
+            foreach (CoopAgentInfo info in agents)
+            {
+                if (info?.Agent == null || ownedAgentMovementDriveStates.ContainsKey(info.Agent))
+                    continue;
+
+                Agent agent = info.Agent;
+                var state = new OwnedAgentMovementDriveState
+                {
+                    AgentInfo = info,
+                    AgentId = info.AgentId,
+                    Authority = info.CurrentAuthority,
+                    AuthorityRevision = info.AuthorityRevision,
+                };
+                try
+                {
+                    if (!CanContinueOwnedAgentMovementDrive(agent, state))
+                    {
+                        invalidatedMovementDriveAgents++;
+                        continue;
+                    }
+
+                    state.ApplyAiDrive = agent.Controller == AgentControllerType.AI;
+                    state.MovementLockedState = state.ApplyAiDrive
+                        ? agent.MovementLockedState
+                        : AgentMovementLockedState.None;
+                    state.LocomotionFlags = Missions.Agents.Packets.AgentData.GetLocomotionMovementFlags(
+                        agent.MovementFlags);
+                    state.MovementInput = agent.MovementInputVector;
+                    state.IsAiPaused = state.ApplyAiDrive && agent.IsPaused;
+                    state.TargetPosition = state.MovementLockedState == AgentMovementLockedState.None
+                        ? default
+                        : agent.GetTargetPosition();
+                    state.TargetDirection = state.MovementLockedState == AgentMovementLockedState.FrameLocked
+                        ? agent.GetTargetDirection()
+                        : default;
+                    ownedAgentMovementDriveStates.Add(agent, state);
+                    DriveOwnedAgent(agent, state);
+                }
+                catch (Exception exception)
+                {
+                    failedMovementDriveAgents++;
+                    Logger.Error(exception, "Movement drive setup failed for {AgentId}", state.AgentId);
+                }
+            }
+        }
+
+        private bool CanContinueOwnedAgentMovementDrive(Agent agent, OwnedAgentMovementDriveState state)
+        {
+            return CanRestoreOwnedAgentMovementDrive(agent, state)
+                && movementDriveSession.HostEpoch == movementDriveHostEpoch;
+        }
+
+        private bool CanRestoreOwnedAgentMovementDrive(Agent agent, OwnedAgentMovementDriveState state)
+        {
+            return movementDriveSession != null
+                && movementDriveSession.HasInstance
+                && movementDriveSession.InstanceId == movementDriveInstanceId
+                && movementDriveSession.OwnControllerId == movementDriveControllerId
+                && state.Authority == movementDriveControllerId
+                && movementDriveRegistry.TryGetAgentInfo(state.AgentId, out var current)
+                && ReferenceEquals(current, state.AgentInfo)
+                && ReferenceEquals(current.Agent, agent)
+                && current.OriginalOwner == movementDriveControllerId
+                && current.CurrentAuthority == state.Authority
+                && current.AuthorityRevision == state.AuthorityRevision
+                && CanDriveOwnedAgent(agent, ownedAgentMovementDriveMission);
+        }
+
+        private void DriveOwnedAgent(Agent agent, OwnedAgentMovementDriveState state)
+        {
+            try
+            {
+                if (!CanContinueOwnedAgentMovementDrive(agent, state))
+                {
+                    RestoreDrivenAgent(agent, state);
+                    return;
+                }
+
+                state.ApplyAiDrive = ApplyOwnedAgentMovementDrive(agent, state.ApplyAiDrive);
+            }
+            catch (Exception exception)
+            {
+                failedMovementDriveAgents++;
+                Logger.Error(exception, "Movement drive apply failed for {AgentId}", state.AgentId);
+                RestoreDrivenAgent(agent, state);
+            }
+        }
+
+        private void RestoreDrivenAgent(Agent agent, OwnedAgentMovementDriveState state)
+        {
+            ownedAgentMovementDriveStates.Remove(agent);
+            try
+            {
+                // A departed authority must never restore its saved state over a successor's state.
+                if (!CanRestoreOwnedAgentMovementDrive(agent, state))
+                {
+                    invalidatedMovementDriveAgents++;
+                    return;
+                }
+
+                bool restoreAiDrive = state.ApplyAiDrive && agent.Controller == AgentControllerType.AI;
+                if (state.ApplyAiDrive && !restoreAiDrive)
+                    agent.ClearTargetFrame();
+                RestoreOwnedAgentMovementDrive(
+                    agent,
+                    state.LocomotionFlags,
+                    state.MovementInput,
+                    restoreAiDrive,
+                    state.IsAiPaused,
+                    state.MovementLockedState,
+                    state.TargetPosition,
+                    state.TargetDirection);
+                restoredMovementDriveAgents++;
+            }
+            catch (Exception exception)
+            {
+                failedMovementDriveAgents++;
+                Logger.Error(exception, "Movement drive restore failed for {AgentId}", state.AgentId);
+            }
+        }
+
+        public void CancelOwnedAgentMovementDrive()
+        {
+            foreach (var entry in ownedAgentMovementDriveStates.ToArray())
+                RestoreDrivenAgent(entry.Key, entry.Value);
+
+            ownedAgentMovementDriveMission = null;
+            movementDriveRegistry = null;
+            movementDriveSession = null;
+            ownedAgentMovementDriveEndTime = 0f;
+        }
+
+        public object GetOwnedAgentMovementDriveStatus()
+        {
+            return new
+            {
+                active = ownedAgentMovementDriveStates.Count > 0,
+                agentCount = ownedAgentMovementDriveStates.Count,
+                controllerId = movementDriveControllerId,
+                instanceId = movementDriveInstanceId,
+                hostEpoch = movementDriveHostEpoch,
+                endTime = ownedAgentMovementDriveEndTime,
+                invalidatedAgents = invalidatedMovementDriveAgents,
+                failedAgents = failedMovementDriveAgents,
+                restoredAgents = restoredMovementDriveAgents,
+                agents = ownedAgentMovementDriveStates.Values.Select(state => new
+                {
+                    agentId = state.AgentId.ToString("D"),
+                    authority = state.Authority,
+                    authorityRevision = state.AuthorityRevision,
+                }).ToArray(),
+            };
+        }
+
+        public override void OnPreMissionTick(float dt)
+        {
+            if (ownedAgentMovementDriveStates.Count > 0)
+                TickOwnedAgentMovementDrive(Mission, Mission?.CurrentTime ?? 0f);
+        }
+
+        internal void TickOwnedAgentMovementDrive(Mission mission, float currentTime)
+        {
+            if (ownedAgentMovementDriveStates.Count == 0)
+                return;
+            if (!ReferenceEquals(ownedAgentMovementDriveMission, mission))
+            {
+                invalidatedMovementDriveAgents += ownedAgentMovementDriveStates.Count;
+                ownedAgentMovementDriveStates.Clear();
+                CancelOwnedAgentMovementDrive();
+                return;
+            }
+            if (currentTime >= ownedAgentMovementDriveEndTime)
+            {
+                CancelOwnedAgentMovementDrive();
+                return;
+            }
+
+            foreach (var entry in ownedAgentMovementDriveStates.ToArray())
+                DriveOwnedAgent(entry.Key, entry.Value);
+        }
+#endif
+
+        public override void OnPreDisplayMissionTick(float dt)
+        {
+            CaptureMountPoseFrame();
+        }
+
+        public override void OnAgentHit(
+            Agent affectedAgent,
+            Agent affectorAgent,
+            in MissionWeapon affectorWeapon,
+            in Blow blow,
+            in AttackCollisionData attackCollisionData)
+        {
+            if (blow.InflictedDamage <= 0
+                || affectedAgent?.Team == null
+                || affectorAgent?.Team == null
+                || !affectedAgent.IsHuman
+                || !affectorAgent.IsHuman
+                || affectedAgent.Team.Side == affectorAgent.Team.Side)
+                return;
+
+            var playerSide = Mission?.PlayerTeam?.Side ?? BattleSideEnum.None;
+            if (affectedAgent.Team.Side == playerSide)
+                ownDamageEvents++;
+        }
+
+        public override void OnEndMission()
+        {
+            ClearDebugBehavior();
+        }
+
+        public override void OnRemoveBehavior()
+        {
+            ClearDebugBehavior();
+        }
+
+        private void ClearDebugBehavior()
+        {
+#if DEBUG
+            CancelOwnedAgentMovementDrive();
+#endif
+            if (ReferenceEquals(battleDebugTickBehavior, this))
+                battleDebugTickBehavior = null;
+        }
+    }
+
+    private sealed class MountPoseSample
+    {
+        public float Time { get; set; }
+        public float Speed { get; set; }
+        public int ActionIndex { get; set; }
+        public string ActionName { get; set; }
+        public string AnimationName { get; set; }
+        public float AnimationProgress { get; set; }
+        public float AnimationSpeed { get; set; }
+        public int TurnDirection { get; set; }
+        public float ChannelWeight { get; set; }
+        public float CurrentActionWeight { get; set; }
+        public Vec3 HeadPosition { get; set; }
+        public Vec3 HeadForward { get; set; }
+    }
+
+#if DEBUG
+    private sealed class OwnedAgentMovementDriveState
+    {
+        public CoopAgentInfo AgentInfo { get; set; }
+        public Guid AgentId { get; set; }
+        public string Authority { get; set; }
+        public long AuthorityRevision { get; set; }
+        public Agent.MovementControlFlag LocomotionFlags { get; set; }
+        public Vec2 MovementInput { get; set; }
+        public bool ApplyAiDrive { get; set; }
+        public bool IsAiPaused { get; set; }
+        public AgentMovementLockedState MovementLockedState { get; set; }
+        public Vec2 TargetPosition { get; set; }
+        public Vec3 TargetDirection { get; set; }
+    }
+
+    private const float OwnedAgentMovementDriveAcceleration = 4f;
+    private const float OwnedAgentMovementDriveTargetDistance = 20f;
+    private static Agent wieldTestAgent;
+    private static Guid wieldTestAgentId;
+    private static EquipmentIndex wieldTestOriginalMainHand;
+    private static bool wieldTestActive;
+    private static Mission columnReinforcementFixtureMission;
+    private static Formation columnReinforcementFixtureFormation;
+    private static MissionBattleSideSpawnContext columnReinforcementFixtureSpawnContext;
+    private static ArrangementOrder columnReinforcementFixtureOriginalOrder;
+    private static BattleSideEnum columnReinforcementFixtureSide;
+    private static int columnReinforcementFixtureFormationIndex;
+    private static int columnReinforcementFixtureKilled;
+    private static Mission replicationFixtureMission;
+    private static readonly HashSet<string> replicationFixtureCatchUpTargets =
+        new HashSet<string>();
+    private static int replicationFixtureInitialAgentIndex = -1;
+    private static FormationSyncFixture formationSyncFixture;
+
+    private sealed class FormationSyncFixture
+    {
+        public Mission Mission;
+        public Agent Agent;
+        public Guid AgentId;
+        public int OriginalFormationIndex;
+        public int TargetFormationIndex;
+    }
+
+    private sealed class ColumnReinforcementCandidate
+    {
+        public BattleSideEnum Side { get; set; }
+        public int FormationIndex { get; set; }
+        public Formation Formation { get; set; }
+        public MissionBattleSideSpawnContext SpawnContext { get; set; }
+        public Agent[] Agents { get; set; }
+    }
+
+    public sealed class ReplicationFixtureCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "replication_fixture";
+
+        public string Description => "Runs the replication fixture debug operation.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("mode", "The mode.", true),
+            new ExpectedArgs("connected_controller_id", "The connected controller id.", false),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            Mission mission = Mission.Current;
+            CoopBattleController controller = mission?.GetMissionBehavior<CoopBattleController>();
+            if (mission == null || controller == null)
+                return Failed("BATTLE_REPLICATION_FIXTURE no active coop battle");
+            if (!BattleSpawnConfig.Enabled || !BattleSpawnGate.IsCoopBattleActive)
+                return Failed("BATTLE_REPLICATION_FIXTURE coop spawn capture is not active");
+            if (!controller.Deployment.IsActivated || !controller.Deployment.IsCommitted)
+                return Failed("BATTLE_REPLICATION_FIXTURE finish local deployment first");
+
+            ResetReplicationFixtureForMission(mission);
+            switch (args[0].ToLowerInvariant())
+            {
+                case "catchup":
+                    return TriggerCatchUpReplicationFixture(controller, args);
+                case "initial":
+                    return TriggerInitialReplicationFixture(controller, mission, args);
+                default:
+                    return Failed("Invalid command argument value.");
+            }
+        }
+    }
+
+    private static CoopCommandResult TriggerCatchUpReplicationFixture(
+        CoopBattleController controller,
+        IReadOnlyList<string> args)
+    {
+        if (args.Count != 2)
+            return Failed("Invalid command argument value.");
+
+        string target = args[1];
+        if (replicationFixtureCatchUpTargets.Contains(target))
+            return Failed($"BATTLE_REPLICATION_FIXTURE_CATCHUP already queued peer={target}");
+        if (!controller.TryDebugReplayOwnedAgentsToConnectedPeer(target, out string error))
+            return Failed($"BATTLE_REPLICATION_FIXTURE_CATCHUP blocked reason={error}");
+
+        replicationFixtureCatchUpTargets.Add(target);
+        return Succeeded($"BATTLE_REPLICATION_FIXTURE_CATCHUP queued peer={target}");
+    }
+
+    private static CoopCommandResult TriggerInitialReplicationFixture(
+        CoopBattleController controller,
+        Mission mission,
+        IReadOnlyList<string> args)
+    {
+        if (args.Count != 1)
+            return Failed("Invalid command argument value.");
+        if (replicationFixtureInitialAgentIndex >= 0)
+            return Failed($"BATTLE_REPLICATION_FIXTURE_INITIAL already queued agentIndex={replicationFixtureInitialAgentIndex}");
+        if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry))
+            return Failed("BATTLE_REPLICATION_FIXTURE_INITIAL network agent registry is unavailable");
+
+        var ownedAgents = registry.GetAgents(controller.Session.OwnControllerId).ToArray();
+        Agent source = ownedAgents
+            .Select(info => info.Agent)
+            .FirstOrDefault(agent =>
+                agent != null &&
+                agent.IsActive() &&
+                agent.IsHuman &&
+                agent.Formation != null &&
+                agent.Team != null &&
+                agent.Character is CharacterObject character &&
+                !character.IsHero &&
+                agent.Origin is CoopAgentOrigin origin &&
+                origin.Party != null &&
+                !string.IsNullOrEmpty(origin.MapEventPartyId));
+        if (source == null)
+            return Failed("BATTLE_REPLICATION_FIXTURE_INITIAL no active locally owned troop is available");
+
+        var sourceOrigin = (CoopAgentOrigin)source.Origin;
+        var character = (CharacterObject)source.Character;
+        var fixtureSeeds = new HashSet<int>(ownedAgents
+            .Select(info => info.Agent?.Origin)
+            .OfType<CoopAgentOrigin>()
+            .Select(origin => origin.UniqueSeed));
+        int fixtureSeed = int.MaxValue;
+        while (fixtureSeeds.Contains(fixtureSeed))
+        {
+            if (fixtureSeed == int.MinValue)
+                return Failed("BATTLE_REPLICATION_FIXTURE_INITIAL no unused fixture seed is available");
+            fixtureSeed--;
+        }
+
+        // The marker retains the party for native team assignment without adding a roster-attributed troop.
+        var fixtureOrigin = new DebugReplicationFixtureAgentOrigin(
+            character,
+            sourceOrigin.Party,
+            sourceOrigin.Rank,
+            sourceOrigin.Banner,
+            new UniqueTroopDescriptor(fixtureSeed));
+        if (mission.PlayerTeam == null)
+            return Failed("BATTLE_REPLICATION_FIXTURE_INITIAL the player team is unavailable");
+
+        bool isPlayerSide = source.Team == mission.PlayerTeam;
+        Agent fixtureAgent;
+        using (new TransientEquipmentSyncScope())
+        {
+            fixtureAgent = mission.SpawnTroop(
+                fixtureOrigin,
+                isPlayerSide,
+                hasFormation: true,
+                spawnWithHorse: source.MountAgent != null,
+                isReinforcement: true,
+                formationTroopCount: 1,
+                formationTroopIndex: 0,
+                isAlarmed: true,
+                wieldInitialWeapons: true,
+                initialPosition: null,
+                initialDirection: null,
+                formationIndex: source.Formation.FormationIndex);
+        }
+        if (fixtureAgent == null)
+            return Failed("BATTLE_REPLICATION_FIXTURE_INITIAL native spawn returned no agent");
+
+        replicationFixtureInitialAgentIndex = fixtureAgent.Index;
+        return Succeeded("BATTLE_REPLICATION_FIXTURE_INITIAL spawned through Mission.SpawnTroop; " +
+               $"agentIndex={fixtureAgent.Index} the normal capture and next controller tick will emit Initial");
+    }
+
+    private static void ResetReplicationFixtureForMission(Mission mission)
+    {
+        if (ReferenceEquals(replicationFixtureMission, mission)) return;
+
+        replicationFixtureMission = mission;
+        replicationFixtureCatchUpTargets.Clear();
+        replicationFixtureInitialAgentIndex = -1;
+    }
+
+    public sealed class ColumnReinforcementFixtureCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "column_reinforcement_fixture";
+
+        public string Description => "Runs the column reinforcement fixture debug operation.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("action", "The action.", true),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            switch (args[0].ToLowerInvariant())
+            {
+                case "start":
+                    return StartColumnReinforcementFixture();
+                case "state":
+                    return GetColumnReinforcementFixtureState();
+                case "restore":
+                    return RestoreColumnReinforcementFixture();
+                default:
+                    return Failed("Invalid command argument value.");
+            }
+        }
+    }
+
+    private static CoopCommandResult StartColumnReinforcementFixture()
+    {
+        if (columnReinforcementFixtureMission != null &&
+            Mission.Current != columnReinforcementFixtureMission)
+        {
+            ClearColumnReinforcementFixture();
+        }
+        if (columnReinforcementFixtureMission != null)
+            return Failed("COLUMN_REINFORCEMENT_FIXTURE already active");
+
+        Mission mission = Mission.Current;
+        CoopBattleController controller = mission?.GetMissionBehavior<CoopBattleController>();
+        DefaultBattleMissionAgentSpawnLogic spawnLogic =
+            mission?.GetMissionBehavior<DefaultBattleMissionAgentSpawnLogic>();
+        if (mission == null || controller == null || spawnLogic == null)
+            return Failed("COLUMN_REINFORCEMENT_FIXTURE no active coop battle");
+        if (!controller.Deployment.IsActivated)
+            return Failed("COLUMN_REINFORCEMENT_FIXTURE finish deployment first");
+        if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry))
+            return Failed("COLUMN_REINFORCEMENT_FIXTURE network agent registry is unavailable");
+
+        ColumnReinforcementCandidate candidate = null;
+        foreach (BattleSideEnum side in new[] { BattleSideEnum.Defender, BattleSideEnum.Attacker })
+        {
+            MissionBattleSideSpawnContext spawnContext =
+                spawnLogic._battleSideSpawnContexts[(int)side];
+            if (spawnContext == null)
+                continue;
+
+            candidate = FindColumnReinforcementCandidate(
+                mission,
+                registry,
+                side,
+                spawnContext,
+                spawnContext._reservedTroops);
+            if (candidate == null && spawnContext._troopSupplier is CoopTroopSupplier supplier)
+            {
+                candidate = supplier.WithSupplyPreview(16, preview =>
+                {
+                    var projectedReserve = new List<IAgentOriginBase>(spawnContext._reservedTroops);
+                    projectedReserve.AddRange(preview);
+                    ColumnReinforcementCandidate previewCandidate =
+                        FindColumnReinforcementCandidate(
+                            mission,
+                            registry,
+                            side,
+                            spawnContext,
+                            projectedReserve);
+                    if (previewCandidate == null)
+                        return null;
+
+                    spawnContext.ReserveTroops(16);
+                    return FindColumnReinforcementCandidate(
+                        mission,
+                        registry,
+                        side,
+                        spawnContext,
+                        spawnContext._reservedTroops);
+                });
+            }
+
+            if (candidate != null)
+                break;
+        }
+
+        if (candidate == null)
+        {
+            return Failed("COLUMN_REINFORCEMENT_FIXTURE no reserve is assigned to an eligible locally controlled formation");
+        }
+
+        columnReinforcementFixtureMission = mission;
+        columnReinforcementFixtureFormation = candidate.Formation;
+        columnReinforcementFixtureSpawnContext = candidate.SpawnContext;
+        columnReinforcementFixtureOriginalOrder = candidate.Formation.ArrangementOrder;
+        columnReinforcementFixtureSide = candidate.Side;
+        columnReinforcementFixtureFormationIndex = candidate.FormationIndex;
+        columnReinforcementFixtureKilled = candidate.Agents.Length;
+
+        candidate.Formation.SetArrangementOrder(ArrangementOrder.ArrangementOrderColumn);
+        foreach (Agent agent in candidate.Agents)
+            BattleTeamKillCommands.Kill(agent);
+
+        return Succeeded("COLUMN_REINFORCEMENT_FIXTURE_STARTED " +
+               $"side={candidate.Side} formation={candidate.FormationIndex} " +
+               $"killed={candidate.Agents.Length} active=0 " +
+               $"reserved={candidate.SpawnContext.ReservedTroopsCount} arrangement=Column");
+    }
+
+    private static ColumnReinforcementCandidate FindColumnReinforcementCandidate(
+        Mission mission,
+        INetworkAgentRegistry registry,
+        BattleSideEnum side,
+        MissionBattleSideSpawnContext spawnContext,
+        List<IAgentOriginBase> reservedTroops)
+    {
+        foreach (var assignment in MissionGameModels.Current.BattleSpawnModel
+                     .GetReinforcementAssignments(side, reservedTroops))
+        {
+            Team team = Mission.GetAgentTeam(assignment.origin, spawnContext.IsPlayerSide);
+            Formation formation = team?.GetFormation((FormationClass)assignment.formationIndex);
+            if (formation == null)
+                continue;
+
+            Agent[] agents = mission.Agents
+                .Where(agent => agent != null
+                    && agent != Agent.Main
+                    && agent.IsActive()
+                    && agent.IsHuman
+                    && agent.Formation == formation
+                    && registry.IsLocallyControlled(agent))
+                .ToArray();
+            if (agents.Length == 0)
+                continue;
+
+            return new ColumnReinforcementCandidate
+            {
+                Side = side,
+                FormationIndex = assignment.formationIndex,
+                Formation = formation,
+                SpawnContext = spawnContext,
+                Agents = agents,
+            };
+        }
+
+        return null;
+    }
+
+    private static CoopCommandResult GetColumnReinforcementFixtureState()
+    {
+        if (columnReinforcementFixtureMission == null)
+            return Failed("COLUMN_REINFORCEMENT_FIXTURE inactive");
+        if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry))
+            return Failed("COLUMN_REINFORCEMENT_FIXTURE network agent registry is unavailable");
+        if (Mission.Current != columnReinforcementFixtureMission ||
+            columnReinforcementFixtureFormation == null ||
+            columnReinforcementFixtureSpawnContext == null)
+        {
+            ClearColumnReinforcementFixture();
+            return Succeeded("COLUMN_REINFORCEMENT_FIXTURE mission ended");
+        }
+
+        int active = Mission.Current.Agents.Count(agent => agent != null
+            && agent.IsActive()
+            && agent.IsHuman
+            && agent != Agent.Main
+            && agent.Formation == columnReinforcementFixtureFormation
+            && registry.IsLocallyControlled(agent));
+        int vanguardPositions = columnReinforcementFixtureFormation.Arrangement is ColumnFormation column
+            ? column.GetUnitPositionsOnVanguardFileIndex().Count
+            : -1;
+
+        return Succeeded("COLUMN_REINFORCEMENT_FIXTURE_STATE " +
+               $"side={columnReinforcementFixtureSide} " +
+               $"formation={columnReinforcementFixtureFormationIndex} " +
+               $"killed={columnReinforcementFixtureKilled} active={active} " +
+               $"replacementObserved={active > 0} " +
+               $"reserved={columnReinforcementFixtureSpawnContext.ReservedTroopsCount} " +
+               $"reinforcementActive={columnReinforcementFixtureSpawnContext.ReinforcementSpawnActive} " +
+               $"arrangement={columnReinforcementFixtureFormation.Arrangement.GetType().Name} " +
+               $"vanguardPositions={vanguardPositions}");
+    }
+
+    private static CoopCommandResult RestoreColumnReinforcementFixture()
+    {
+        if (columnReinforcementFixtureMission == null)
+            return Failed("COLUMN_REINFORCEMENT_FIXTURE inactive");
+
+        bool missionActive = Mission.Current == columnReinforcementFixtureMission;
+        if (missionActive && columnReinforcementFixtureFormation != null)
+            columnReinforcementFixtureFormation.SetArrangementOrder(columnReinforcementFixtureOriginalOrder);
+
+        int killed = columnReinforcementFixtureKilled;
+        ClearColumnReinforcementFixture();
+        return Succeeded("COLUMN_REINFORCEMENT_FIXTURE_RESTORED " +
+               $"arrangementRestored={missionActive} casualtiesRemain={killed}");
+    }
+
+    private static void ClearColumnReinforcementFixture()
+    {
+        columnReinforcementFixtureMission = null;
+        columnReinforcementFixtureFormation = null;
+        columnReinforcementFixtureSpawnContext = null;
+        columnReinforcementFixtureOriginalOrder = default;
+        columnReinforcementFixtureSide = BattleSideEnum.None;
+        columnReinforcementFixtureFormationIndex = -1;
+        columnReinforcementFixtureKilled = 0;
+    }
+
+    public sealed class ActionPerformanceCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "action_performance";
+
+        public string Description => "Runs the action performance debug operation.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("action", "The action.", true),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            switch (args[0].ToLowerInvariant())
+            {
+                case "start":
+                    MissionActionDiagnostics.StartPerformance();
+                    return Succeeded("Action performance instrumentation is ON.");
+                case "snapshot":
+                    return Succeeded("ACTION_PERFORMANCE " +
+                           MissionActionDiagnostics.SnapshotPerformance(
+                               stop: false));
+                case "stop":
+                    return Succeeded("ACTION_PERFORMANCE " +
+                           MissionActionDiagnostics.SnapshotPerformance(
+                               stop: true));
+                case "status":
+                    return Succeeded("Action performance instrumentation is " +
+                           (MissionActionDiagnostics.PerformanceEnabled
+                               ? "ON."
+                               : "OFF."));
+                default:
+                    return Failed("Invalid command argument value.");
+            }
+        }
+    }
+
+    public sealed class AnimationTraceCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "animation_trace";
+
+        public string Description => "Runs the animation trace debug operation.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("action", "The action.", true),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            switch (args[0].ToLowerInvariant())
+            {
+                case "start":
+                    MissionActionDiagnostics.StartAnimationTrace();
+                    return Succeeded("Battle animation trace is ON.");
+                case "snapshot":
+                    return Succeeded("BATTLE_ANIMATION_TRACE " +
+                           MissionActionDiagnostics.SnapshotAnimationTrace(
+                               stop: false));
+                case "stop":
+                    return Succeeded("BATTLE_ANIMATION_TRACE " +
+                           MissionActionDiagnostics.SnapshotAnimationTrace(
+                               stop: true));
+                case "status":
+                    return Succeeded("Battle animation trace is " +
+                           (MissionActionDiagnostics.AnimationTraceEnabled
+                               ? "ON."
+                               : "OFF."));
+                default:
+                    return Failed("Invalid command argument value.");
+            }
+        }
+    }
+
+    public sealed class WieldTestCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "wield_test";
+
+        public string Description => "Runs the wield test debug operation.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("action", "The action.", true),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            switch (args[0].ToLowerInvariant())
+            {
+                case "start":
+                    return StartWieldTest();
+                case "restore":
+                    return RestoreWieldTest();
+                case "status":
+                    return Failed(wieldTestActive
+                        ? $"WIELD_TEST active agent={wieldTestAgentId:D}"
+                        : "WIELD_TEST inactive");
+                default:
+                    return Failed("Invalid command argument value.");
+            }
+        }
+    }
+
+    private static CoopCommandResult StartWieldTest()
+    {
+        if (wieldTestActive) return Failed("WIELD_TEST already active");
+        Agent agent = Agent.Main;
+        if (agent == null || !agent.IsActive() || agent.Mission != Mission.Current)
+            return Failed("WIELD_TEST no active main agent");
+        if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry)
+            || !registry.TryGetAgentInfo(agent, out var info)
+            || !registry.IsLocallyControlled(info.AgentId))
+        {
+            return Failed("WIELD_TEST main agent is not locally controlled");
+        }
+
+        EquipmentIndex original = agent.GetPrimaryWieldedItemIndex();
+        EquipmentIndex target = EquipmentIndex.None;
+        if (original == EquipmentIndex.None)
+        {
+            for (EquipmentIndex slot = EquipmentIndex.WeaponItemBeginSlot;
+                 slot < EquipmentIndex.NumAllWeaponSlots;
+                 slot++)
+            {
+                if (agent.Equipment[slot].Item == null) continue;
+                target = slot;
+                break;
+            }
+            if (target == EquipmentIndex.None)
+                return Failed("WIELD_TEST main agent has no weapon");
+        }
+
+        wieldTestAgent = agent;
+        wieldTestAgentId = info.AgentId;
+        wieldTestOriginalMainHand = original;
+        wieldTestActive = true;
+        if (original == EquipmentIndex.None)
+        {
+            agent.TryToWieldWeaponInSlot(
+                target,
+                Agent.WeaponWieldActionType.WithAnimationUninterruptible,
+                isWieldedOnSpawn: false);
+        }
+        else
+        {
+            agent.TryToSheathWeaponInHand(
+                Agent.HandIndex.MainHand,
+                Agent.WeaponWieldActionType.WithAnimationUninterruptible);
+        }
+        return Succeeded($"WIELD_TEST_STARTED agent={wieldTestAgentId:D} " +
+            $"original={(int)original} target={(int)target}");
+    }
+
+    private static CoopCommandResult RestoreWieldTest()
+    {
+        if (!wieldTestActive) return Failed("WIELD_TEST inactive");
+        if (wieldTestAgent == null
+            || !wieldTestAgent.IsActive()
+            || wieldTestAgent.Mission != Mission.Current)
+        {
+            return Failed("WIELD_TEST agent unavailable");
+        }
+
+        if (wieldTestOriginalMainHand == EquipmentIndex.None)
+        {
+            wieldTestAgent.TryToSheathWeaponInHand(
+                Agent.HandIndex.MainHand,
+                Agent.WeaponWieldActionType.WithAnimationUninterruptible);
+        }
+        else
+        {
+            wieldTestAgent.TryToWieldWeaponInSlot(
+                wieldTestOriginalMainHand,
+                Agent.WeaponWieldActionType.WithAnimationUninterruptible,
+                isWieldedOnSpawn: false);
+        }
+        Guid restoredAgentId = wieldTestAgentId;
+        wieldTestAgent = null;
+        wieldTestAgentId = Guid.Empty;
+        wieldTestOriginalMainHand = EquipmentIndex.None;
+        wieldTestActive = false;
+        return Succeeded($"WIELD_TEST_RESTORED agent={restoredAgentId:D}");
+    }
+
+    public sealed class FormationSyncFixtureCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "formation_sync_fixture";
+
+        public string Description => "Moves one local troop between formations and reports its replicated state.";
+
+        public CoopCommandSide Side => CoopCommandSide.Client;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("action", "The action.", true),
+            new ExpectedArgs("agent_id", "The agent id for state.", false),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            switch (args[0].ToLowerInvariant())
+            {
+                case "start":
+                    return args.Count == 1 ? StartFormationSyncFixture() : Failed("Invalid command argument value.");
+                case "state":
+                    return args.Count == 2 ? GetFormationSyncFixtureState(args[1]) : Failed("Invalid command argument value.");
+                case "restore":
+                    return args.Count == 1 ? RestoreFormationSyncFixture() : Failed("Invalid command argument value.");
+                default:
+                    return Failed("Invalid command argument value.");
+            }
+        }
+    }
+
+    private static CoopCommandResult StartFormationSyncFixture()
+    {
+        if (formationSyncFixture != null)
+            return Failed("FORMATION_SYNC_FIXTURE is already active");
+
+        Mission mission = Mission.Current;
+        CoopBattleController controller = mission?.GetMissionBehavior<CoopBattleController>();
+        if (mission == null || controller == null || !controller.Deployment.IsCommitted)
+            return Failed("FORMATION_SYNC_FIXTURE requires an active committed co-op battle");
+        if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry)
+            || !ContainerProvider.TryResolve<IAgentFormationAssigner>(out var formationAssigner))
+        {
+            return Failed("FORMATION_SYNC_FIXTURE required battle services are unavailable");
+        }
+
+        CoopAgentInfo info = registry.GetAgents(controller.Session.OwnControllerId)
+            .Where(candidate => candidate.OriginalOwner == controller.Session.OwnControllerId)
+            .Where(candidate => candidate.Agent != null && candidate.Agent.IsActive()
+                && candidate.Agent.IsHuman && !candidate.Agent.IsMount
+                && candidate.Agent.Team == mission.PlayerTeam && candidate.Agent.Formation != null)
+            .OrderBy(candidate => candidate.AgentId)
+            .FirstOrDefault();
+        if (info == null)
+            return Failed("FORMATION_SYNC_FIXTURE has no locally owned troop");
+
+        int originalFormationIndex = (int)info.Agent.Formation.FormationIndex;
+        int targetFormationIndex = (originalFormationIndex + 1) % (int)FormationClass.NumberOfAllFormations;
+        Formation targetFormation = formationAssigner.Assign(info.Agent, targetFormationIndex);
+        if (targetFormation == null || !ReferenceEquals(targetFormation, info.Agent.Formation))
+            return Failed("FORMATION_SYNC_FIXTURE could not assign the target formation");
+
+        formationSyncFixture = new FormationSyncFixture
+        {
+            Mission = mission,
+            Agent = info.Agent,
+            AgentId = info.AgentId,
+            OriginalFormationIndex = originalFormationIndex,
+            TargetFormationIndex = targetFormationIndex,
+        };
+        return Succeeded(FormatFormationSyncFixtureState("started", info));
+    }
+
+    private static CoopCommandResult GetFormationSyncFixtureState(string value)
+    {
+        if (!Guid.TryParseExact(value, "N", out Guid agentId))
+            return Failed("Invalid command argument value.");
+        if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry)
+            || !registry.TryGetAgentInfo(agentId, out CoopAgentInfo info)
+            || info.Agent == null || !info.Agent.IsActive())
+        {
+            return Failed($"FORMATION_SYNC_FIXTURE missing agent={agentId:N}");
+        }
+
+        return Succeeded(FormatFormationSyncFixtureState("observed", info));
+    }
+
+    private static CoopCommandResult RestoreFormationSyncFixture()
+    {
+        FormationSyncFixture fixture = formationSyncFixture;
+        if (fixture == null)
+            return Failed("FORMATION_SYNC_FIXTURE is inactive");
+        if (fixture.Mission != Mission.Current || fixture.Agent == null || !fixture.Agent.IsActive()
+            || !ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry)
+            || !registry.TryGetAgentInfo(fixture.AgentId, out CoopAgentInfo info)
+            || info.Agent != fixture.Agent
+            || !ContainerProvider.TryResolve<IAgentFormationAssigner>(out var formationAssigner))
+        {
+            return Failed("FORMATION_SYNC_FIXTURE cannot restore the selected troop");
+        }
+
+        Formation originalFormation = formationAssigner.Assign(fixture.Agent, fixture.OriginalFormationIndex);
+        if (originalFormation == null || (int)originalFormation.FormationIndex != fixture.OriginalFormationIndex)
+            return Failed("FORMATION_SYNC_FIXTURE could not restore the original formation");
+
+        string restoredState = FormatFormationSyncFixtureState("restored", info);
+        formationSyncFixture = null;
+        return Succeeded(restoredState);
+    }
+
+    private static string FormatFormationSyncFixtureState(string action, CoopAgentInfo info)
+    {
+        int formationIndex = info.Agent.Formation == null ? -1 : (int)info.Agent.Formation.FormationIndex;
+        FormationSyncFixture fixture = formationSyncFixture?.AgentId == info.AgentId
+            ? formationSyncFixture
+            : null;
+        string structuredState = JsonConvert.SerializeObject(new
+        {
+            action,
+            agentId = info.AgentId.ToString("N"),
+            authority = info.CurrentAuthority,
+            authorityRevision = info.AuthorityRevision,
+            formationIndex,
+            originalFormationIndex = fixture?.OriginalFormationIndex,
+            targetFormationIndex = fixture?.TargetFormationIndex,
+        });
+        return $"FORMATION_SYNC_FIXTURE {action} agent={info.AgentId:N} formation={formationIndex} " +
+               $"authority={info.CurrentAuthority} revision={info.AuthorityRevision}\nLIVE_TEST_JSON={structuredState}";
+    }
+
+#endif
+
+#if DEBUG
+    public sealed class ItemModifierStateCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "item_modifier_state";
+
+        public string Description => "Reports item modifier state.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            Mission mission = Mission.Current;
+            CoopBattleController controller = mission?.GetMissionBehavior<CoopBattleController>();
+            if (mission == null || controller == null)
+                return Failed("No active coop battle mission");
+            if (!ContainerProvider.TryResolve<IObjectManager>(out var objectManager))
+                return Failed("Object manager is unavailable");
+
+            int activeAgents = 0;
+            int weaponCount = 0;
+            int modifiedWeapons = 0;
+            int unmodifiedWeapons = 0;
+            int canonicalModifiers = 0;
+            int unregisteredModifiers = 0;
+            int nonCanonicalModifiers = 0;
+            var modifierIds = new HashSet<string>();
+
+            foreach (Agent agent in mission.Agents)
+            {
+                if (!agent.IsActive() || !agent.IsHuman) continue;
+
+                activeAgents++;
+                MissionEquipment equipment = agent.Equipment;
+                if (equipment == null) continue;
+
+                for (EquipmentIndex index = EquipmentIndex.WeaponItemBeginSlot;
+                     index < EquipmentIndex.NumAllWeaponSlots;
+                     index++)
+                {
+                    MissionWeapon weapon = equipment[index];
+                    if (weapon.Item == null) continue;
+
+                    weaponCount++;
+                    ItemModifier modifier = weapon.ItemModifier;
+                    if (modifier == null)
+                    {
+                        unmodifiedWeapons++;
+                        continue;
+                    }
+
+                    modifiedWeapons++;
+                    if (!objectManager.TryGetId(modifier, out string modifierId))
+                    {
+                        unregisteredModifiers++;
+                        continue;
+                    }
+
+                    modifierIds.Add(modifierId);
+                    if (!objectManager.TryGetObject(modifierId, out ItemModifier canonicalModifier) ||
+                        !ReferenceEquals(modifier, canonicalModifier))
+                    {
+                        nonCanonicalModifiers++;
+                        continue;
+                    }
+
+                    canonicalModifiers++;
+                }
+            }
+
+            string structuredState = JsonConvert.SerializeObject(new
+            {
+                controllerId = controller.Session.OwnControllerId,
+                activeAgents,
+                weaponCount,
+                modifiedWeapons,
+                unmodifiedWeapons,
+                canonicalModifiers,
+                unregisteredModifiers,
+                nonCanonicalModifiers,
+                distinctModifierIds = modifierIds.OrderBy(id => id).ToArray(),
+            });
+
+            return Succeeded($"ITEM_MODIFIER_STATE activeAgents={activeAgents}|weapons={weaponCount}|" +
+                $"modified={modifiedWeapons}|unmodified={unmodifiedWeapons}|" +
+                $"canonical={canonicalModifiers}|unregistered={unregisteredModifiers}|" +
+                $"nonCanonical={nonCanonicalModifiers}\n" +
+                $"LIVE_TEST_JSON={structuredState}");
+        }
+    }
+#endif
+
+    public sealed class StateCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "state";
+
+        public string Description => "Reports state.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            var mission = Mission.Current;
+            var controller = mission?.GetMissionBehavior<CoopBattleController>();
+            var playerTeam = mission?.PlayerTeam;
+            if (mission == null || controller == null)
+            {
+                return Failed("No active coop battle mission");
+            }
+
+            ObserveMission(mission);
+            EnsureBattleDebugTickBehavior(mission);
+
+            var enemies = new List<Agent>();
+            int enemyParties = 0;
+            if (playerTeam != null)
+            {
+                var enemySide = playerTeam.Side == BattleSideEnum.Attacker
+                    ? BattleSideEnum.Defender
+                    : BattleSideEnum.Attacker;
+                enemies.AddRange(mission.Agents
+                    .Where(agent => agent.IsActive() && agent.IsHuman && agent.Team?.Side == enemySide));
+                enemyParties = playerTeam.Side == BattleSideEnum.Attacker
+                    ? MobileParty.MainParty?.MapEvent?.DefenderSide?.Parties?.Count ?? 0
+                    : MobileParty.MainParty?.MapEvent?.AttackerSide?.Parties?.Count ?? 0;
+            }
+
+            int moved = 0;
+            foreach (var enemy in enemies)
+            {
+                if (EnemyPositions.TryGetValue(enemy.Index, out var previous)
+                    && previous.DistanceSquared(enemy.Position) > 0.25f)
+                {
+                    moved++;
+                }
+                EnemyPositions[enemy.Index] = enemy.Position;
+            }
+
+            bool deploymentReady = mission.GetMissionBehavior<DeploymentMissionController>()?.TeamSetupOver == true;
+            int activeAgents = mission.Agents.Count(agent => agent.IsActive());
+            int enemyFleeing = enemies.Count(agent => agent.IsRunningAway);
+            var result = mission.MissionResult;
+            var suppliers = CoopTroopSupplierRegistry.GetSuppliers(controller.Session.InstanceId);
+            var receiverReserves = suppliers
+                .Where(supplier => !string.IsNullOrEmpty(supplier.PlayerPartyId))
+                .Select(supplier => $"{supplier.Side}:{supplier.PlayerPartyId}")
+                .ToArray();
+
+            ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry);
+            var humanAgents = mission.Agents.Where(agent => agent.IsActive() && agent.IsHuman)
+                .Select(agent =>
+                {
+                    CoopAgentInfo info = null;
+                    registry?.TryGetAgentInfo(agent, out info);
+                    bool locallyControlled = info != null && info.CurrentAuthority == controller.Session.OwnControllerId;
+                    return new
+                    {
+                        agentId = info?.AgentId.ToString("D"),
+                        index = agent.Index,
+                        side = agent.Team?.Side.ToString(),
+                        authority = info?.CurrentAuthority,
+                        locallyControlled,
+                        fleeing = agent.IsRunningAway,
+                        morale = locallyControlled ? (float?)agent.GetMorale() : null
+                    };
+                }).ToArray();
+            var routState = new
+            {
+                registryAvailable = registry != null,
+                sides = new[] { BattleSideEnum.Attacker, BattleSideEnum.Defender }.Select(side => new
+                {
+                    side = side.ToString(),
+                    active = humanAgents.Count(agent => agent.side == side.ToString()),
+                    fleeing = humanAgents.Count(agent => agent.side == side.ToString() && agent.fleeing),
+                    owned = humanAgents.Count(agent => agent.side == side.ToString() && agent.locallyControlled),
+                    ownedFleeing = humanAgents.Count(agent => agent.side == side.ToString() && agent.locallyControlled && agent.fleeing),
+                    minimumOwnedMorale = humanAgents.Where(agent => agent.side == side.ToString()).Min(agent => agent.morale)
+                }).ToArray(),
+                fleeingAgents = humanAgents.Where(agent => agent.fleeing).Take(20).ToArray(),
+                fleeingSamplesTruncated = humanAgents.Count(agent => agent.fleeing) > 20
+            };
+
+            return Succeeded($"instance={controller.Session.InstanceId} host={controller.Session.IsLocalHost} " +
+                $"activated={controller.Deployment.IsActivated} committed={controller.Deployment.IsCommitted} " +
+                $"deploymentReady={deploymentReady} mainAgent={Agent.Main != null} activeAgents={activeAgents} " +
+                $"reserveSuppliers={suppliers.Count} populatedReserves={suppliers.Count(supplier => supplier.IsPopulated)} " +
+                $"receiverOwnedReserves={receiverReserves.Length} receiverReserve={string.Join(",", receiverReserves)} " +
+                $"playerSide={playerTeam?.Side.ToString() ?? "None"} enemyParties={enemyParties} enemyActive={enemies.Count} " +
+                $"enemyAi={enemies.Count(agent => agent.IsAIControlled)} enemyFleeing={enemyFleeing} " +
+                $"enemyMovedSinceLast={moved} damageReceivedEvents={ownDamageEvents} " +
+                $"resultState={result?.BattleState.ToString() ?? "None"} " +
+                $"battleResolved={result?.BattleResolved ?? false} playerVictory={result?.PlayerVictory ?? false}\n" +
+                "LIVE_TEST_JSON=" + JsonConvert.SerializeObject(routState));
+        }
+    }
+
+    public sealed class SizeStateCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "size_state";
+
+        public string Description => "Reports size state.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            Mission mission = Mission.Current;
+            var controller = mission?.GetMissionBehavior<CoopBattleController>();
+            var spawnHandler = mission?.GetMissionBehavior<CoopBattleMissionSpawnHandler>();
+            if (mission == null || controller == null || spawnHandler == null)
+                return Failed("No active coop battle mission");
+            if (!ContainerProvider.TryResolve<IBattleAgentBudget>(out var agentBudget))
+                return Failed("Battle agent budget is unavailable");
+
+            CoopBattleMissionSpawnHandler.BattleSizeState state = spawnHandler.CaptureBattleSizeState();
+            int activeAgents = mission.Agents.Count(agent => agent.IsActive());
+            int targetTotal = state.DefenderTarget + state.AttackerTarget;
+            string structuredState = JsonConvert.SerializeObject(new
+            {
+                controllerId = controller.Session.OwnControllerId,
+                state.IsSized,
+                authoritativeBattleSize = state.BattleSize,
+                state.DefenderTotal,
+                state.AttackerTotal,
+                state.DefenderTarget,
+                state.AttackerTarget,
+                authoritativeTargetTotal = targetTotal,
+                state.AllocationRevision,
+                activeAgents,
+                renderedAgentLimit = agentBudget.MaxRenderedAgents,
+            });
+
+            return Succeeded($"BATTLE_SIZE_STATE battleSize={state.BattleSize}|" +
+                $"defenderTotal={state.DefenderTotal}|attackerTotal={state.AttackerTotal}|" +
+                $"defenderTarget={state.DefenderTarget}|attackerTarget={state.AttackerTarget}|" +
+                $"targetTotal={targetTotal}|activeAgents={activeAgents}|" +
+                $"renderedAgentLimit={agentBudget.MaxRenderedAgents}\n" +
+                $"LIVE_TEST_JSON={structuredState}");
+        }
+    }
+
+    public sealed class ChargeOwnedFormationsCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "charge_owned_formations";
+
+        public string Description => "Runs the charge owned formations debug operation.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            var mission = Mission.Current;
+            var controller = mission?.GetMissionBehavior<CoopBattleController>();
+            if (mission == null || controller == null)
+                return Failed("No active coop battle mission");
+            if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry))
+                return Failed("Network agent registry is unavailable");
+
+            CoopAgentInfo[] ownedAgents = registry.GetAgents(controller.Session.OwnControllerId)
+                .Where(info => info.OriginalOwner == controller.Session.OwnControllerId)
+                .Where(info => info.Agent != null
+                    && info.Agent.IsActive()
+                    && info.Agent.IsHuman
+                    && info.Agent.Team == mission.PlayerTeam
+                    && info.Agent.Formation != null)
+                .ToArray();
+            Formation[] formations = ownedAgents
+                .Select(info => info.Agent.Formation)
+                .Distinct()
+                .ToArray();
+            if (formations.Length == 0)
+                return Failed("The local player has no active owned formations");
+
+            foreach (Formation formation in formations)
+                formation.SetMovementOrder(MovementOrder.MovementOrderCharge);
+
+            return Succeeded($"Charged {formations.Length} locally owned formation(s) with {ownedAgents.Length} active agent(s)");
+        }
+    }
+
+#if DEBUG
+    public sealed class DriveOwnedAgentsCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "drive_owned_agents";
+
+        public string Description => "Drives locally authoritative agents for a bounded duration.";
+
+        public CoopCommandSide Side => CoopCommandSide.Client;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("seconds", "The duration in seconds."),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (!int.TryParse(
+                    args[0],
+                    NumberStyles.Integer,
+                    CultureInfo.InvariantCulture,
+                    out int durationSeconds)
+                || durationSeconds < 3
+                || durationSeconds > 30)
+            {
+                return Failed("Usage: coop.debug.battle.drive_owned_agents <seconds: 3-30>");
+            }
+
+            Mission mission = Mission.Current;
+            CoopBattleController controller = mission?.GetMissionBehavior<CoopBattleController>();
+            if (mission == null || controller == null)
+                return Failed("No active coop battle mission");
+            if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry))
+                return Failed("Network agent registry is unavailable");
+
+            string controllerId = controller.Session.OwnControllerId;
+            CoopAgentInfo[] ownedAgents = registry.GetAgents(controllerId)
+                .Where(info => info.OriginalOwner == controllerId)
+                .Where(info => info.CurrentAuthority == controllerId)
+                .Where(info => info.Agent != null
+                    && info.Agent.Mission == mission
+                    && info.Agent.IsActive())
+                .ToArray();
+            CoopAgentInfo[] driveAgents = ownedAgents
+                .Where(info => !info.Agent.IsMount)
+                .ToArray();
+            if (driveAgents.Length == 0)
+                driveAgents = ownedAgents;
+            if (driveAgents.Length == 0)
+                return Failed("The local player has no active authoritative agents");
+
+            ObserveMission(mission);
+            EnsureBattleDebugTickBehavior(mission);
+            battleDebugTickBehavior.BeginOwnedAgentMovementDrive(
+                mission,
+                registry,
+                controller.Session,
+                driveAgents,
+                durationSeconds);
+
+            bool success = battleDebugTickBehavior.OwnedAgentMovementDriveAgentCount > 0;
+            string structuredState = JsonConvert.SerializeObject(new
+            {
+                success,
+                controllerId,
+                durationSeconds,
+                agentCount = battleDebugTickBehavior.OwnedAgentMovementDriveAgentCount,
+                agentIds = battleDebugTickBehavior.OwnedAgentMovementDriveAgentIds,
+                drive = battleDebugTickBehavior.GetOwnedAgentMovementDriveStatus(),
+            });
+            if (!success)
+                return Failed($"No authoritative agents could be driven\nLIVE_TEST_JSON={structuredState}");
+            return Succeeded($"DRIVING_OWNED_AGENTS controller={controllerId}|seconds={durationSeconds}|" +
+                $"agents={battleDebugTickBehavior.OwnedAgentMovementDriveAgentCount}\nLIVE_TEST_JSON={structuredState}");
+        }
+    }
+
+    public sealed class CancelOwnedAgentDriveCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+        public string Name => "cancel_owned_agent_drive";
+        public string Description => "Stops the movement drive and restores agents whose authority is unchanged.";
+        public CoopCommandSide Side => CoopCommandSide.Client;
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            battleDebugTickBehavior?.CancelOwnedAgentMovementDrive();
+            return Succeeded("OWNED_AGENT_DRIVE_CANCELLED\nLIVE_TEST_JSON=" + JsonConvert.SerializeObject(new
+            {
+                success = true,
+                drive = battleDebugTickBehavior?.GetOwnedAgentMovementDriveStatus(),
+            }));
+        }
+    }
+
+    public sealed class OwnedAgentDriveStateCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+        public string Name => "owned_agent_drive_state";
+        public string Description => "Reports active movement drive identities and cleanup counts.";
+        public CoopCommandSide Side => CoopCommandSide.Client;
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            return Succeeded("OWNED_AGENT_DRIVE_STATE\nLIVE_TEST_JSON=" + JsonConvert.SerializeObject(new
+            {
+                success = true,
+                drive = battleDebugTickBehavior?.GetOwnedAgentMovementDriveStatus(),
+            }));
+        }
+    }
+
+    internal static bool ApplyOwnedAgentMovementDrive(Agent agent, bool applyAiDrive)
+    {
+        if (applyAiDrive && agent.Controller != AgentControllerType.AI)
+        {
+            agent.ClearTargetFrame();
+            applyAiDrive = false;
+        }
+        if (applyAiDrive)
+            agent.SetIsAIPaused(false);
+
+        Missions.Agents.Packets.AgentData.ApplyLocomotionMovementFlags(
+            agent,
+            Agent.MovementControlFlag.Forward);
+        Missions.Agents.Packets.AgentData.ApplyMovementInput(agent, Vec2.Forward);
+
+        // Local player input is overwritten by the client control loop, so drive this DEBUG fixture natively.
+        Vec3 acceleration = new Vec3(agent.LookDirection.X, agent.LookDirection.Y, 0f);
+        if (acceleration.LengthSquared <= 0.0001f)
+            acceleration = new Vec3(Vec2.Forward.X, Vec2.Forward.Y, 0f);
+        else
+            acceleration.Normalize();
+
+        if (applyAiDrive)
+        {
+            Vec2 direction = acceleration.AsVec2;
+            Vec2 targetPosition = agent.Position.AsVec2 +
+                (direction * OwnedAgentMovementDriveTargetDistance);
+            agent.SetTargetPositionAndDirection(in targetPosition, in acceleration);
+        }
+
+        acceleration = new Vec3(
+            acceleration.X * OwnedAgentMovementDriveAcceleration,
+            acceleration.Y * OwnedAgentMovementDriveAcceleration,
+            0f);
+        agent.AddAcceleration(in acceleration);
+        return applyAiDrive;
+    }
+
+    internal static void RestoreOwnedAgentMovementDrive(
+        Agent agent,
+        Agent.MovementControlFlag locomotionFlags,
+        Vec2 movementInput,
+        bool restoreAiDrive,
+        bool isAiPaused,
+        AgentMovementLockedState movementLockedState,
+        Vec2 targetPosition,
+        Vec3 targetDirection)
+    {
+        if (restoreAiDrive)
+        {
+            agent.SetIsAIPaused(isAiPaused);
+            switch (movementLockedState)
+            {
+                case AgentMovementLockedState.PositionLocked:
+                    agent.SetTargetPosition(targetPosition);
+                    break;
+                case AgentMovementLockedState.FrameLocked:
+                    agent.SetTargetPositionAndDirection(in targetPosition, in targetDirection);
+                    break;
+                default:
+                    agent.ClearTargetFrame();
+                    break;
+            }
+        }
+        Missions.Agents.Packets.AgentData.ApplyLocomotionMovementFlags(agent, locomotionFlags);
+        Missions.Agents.Packets.AgentData.ApplyMovementInput(agent, movementInput);
+    }
+
+    internal static bool CanDriveOwnedAgent(Agent agent, Mission mission)
+    {
+        return agent != null
+            && mission != null
+            && agent.Mission == mission
+            && agent.IsActive();
+    }
+#endif
+
+    public sealed class MountStateCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "mount_state";
+
+        public string Description => "Reports mount state.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("authority", "The authority.", false),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            var mission = Mission.Current;
+            var controller = mission?.GetMissionBehavior<CoopBattleController>();
+            if (mission == null || controller == null)
+                return Failed("No active coop battle mission");
+            if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry))
+                return Failed("Network agent registry is unavailable");
+
+            string filter = args.Count == 1 ? args[0] : null;
+            var mounts = registry.GetControllerIds()
+                .SelectMany(registry.GetAgents)
+                .Where(info => MatchesAuthority(
+                    controller.Session,
+                    info,
+                    filter,
+                    mission.PlayerTeam))
+                .Where(info => info.Agent != null && info.Agent.IsMount && info.Agent.IsActive())
+                .OrderBy(info => info.AgentId)
+                .ToArray();
+
+            int stationaryCount = 0;
+            int stationaryAnimatedCount = 0;
+            int stationaryTurningCount = 0;
+            var output = new StringBuilder();
+            foreach (var info in mounts)
+            {
+                Agent mount = info.Agent;
+                float speed = mount.GetRealGlobalVelocity().AsVec2.Length;
+                bool stationary = speed <= AgentMountData.StationarySpeedThreshold;
+                AgentMountData.GetRenderedAction0State(
+                    mount,
+                    out string animationName,
+                    out float animationSpeed,
+                    out float animationProgress);
+                int actionIndex = mount.GetCurrentAction(0).Index;
+                string actionName = AgentActionData.GetActionNameWithCode(actionIndex);
+                int turnDirection = AgentMountData.GetTurnDirection(actionName, animationName);
+                bool locomotionAction = AgentMountData.IsLocomotionAction(actionIndex, animationName);
+                bool stationaryAnimated = stationary
+                    && locomotionAction
+                    && animationSpeed > 0.001f;
+                bool stationaryTurning = stationary
+                    && turnDirection != AgentMountData.NoTurn
+                    && animationSpeed > 0.001f;
+                if (stationary) stationaryCount++;
+                if (stationaryAnimated) stationaryAnimatedCount++;
+                if (stationaryTurning) stationaryTurningCount++;
+
+                string riderId = "none";
+                if (mount.RiderAgent != null
+                    && registry.TryGetAgentInfo(mount.RiderAgent, out var riderInfo))
+                {
+                    riderId = riderInfo.AgentId.ToString("N");
+                }
+
+                output.Append("id=").Append(info.AgentId.ToString("N"))
+                    .Append(" authority=").Append(info.CurrentAuthority)
+                    .Append(" local=").Append(controller.Session.IsOwn(info.CurrentAuthority))
+                    .Append(" rider=").Append(riderId)
+                    .Append(" position=").Append(mount.Position.X.ToString("0.000", CultureInfo.InvariantCulture))
+                    .Append(',').Append(mount.Position.Y.ToString("0.000", CultureInfo.InvariantCulture))
+                    .Append(" speed=").Append(speed.ToString("0.000", CultureInfo.InvariantCulture))
+                    .Append(" input=").Append(mount.MovementInputVector.X.ToString("0.000", CultureInfo.InvariantCulture))
+                    .Append(',').Append(mount.MovementInputVector.Y.ToString("0.000", CultureInfo.InvariantCulture))
+                    .Append(" direction=").Append(mount.GetMovementDirection().X.ToString("0.000", CultureInfo.InvariantCulture))
+                    .Append(',').Append(mount.GetMovementDirection().Y.ToString("0.000", CultureInfo.InvariantCulture))
+                    .Append(" action0=").Append(actionIndex)
+                    .Append(" actionName=").Append(actionName ?? "none")
+                    .Append(" actionProgress=").Append(animationProgress.ToString("0.000", CultureInfo.InvariantCulture))
+                    .Append(" animation=").Append(animationName ?? "none")
+                    .Append(" animationSpeed=").Append(animationSpeed.ToString("0.000", CultureInfo.InvariantCulture))
+                    .Append(" locomotion=").Append(locomotionAction)
+                    .Append(" turnDirection=").Append(turnDirection)
+                    .Append(" stationaryTurning=").Append(stationaryTurning)
+                    .Append(" stationaryAnimated=").Append(stationaryAnimated)
+                    .AppendLine();
+            }
+
+            output.Insert(
+                0,
+                $"mounts={mounts.Length} stationary={stationaryCount} stationaryAnimated={stationaryAnimatedCount} " +
+                $"stationaryTurning={stationaryTurningCount} " +
+                $"own={controller.Session.OwnControllerId} host={controller.Session.IsLocalHost}{Environment.NewLine}");
+            return Succeeded(output.ToString().TrimEnd());
+        }
+    }
+
+    public sealed class CaptureMountPoseCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "capture_mount_pose";
+
+        public string Description => "Runs the capture mount pose debug operation.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("mount_agent_id", "The mount agent id.", true),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (!Guid.TryParseExact(args[0], "N", out Guid mountId))
+                return Failed("Invalid command argument value.");
+
+            var mission = Mission.Current;
+            if (mission == null)
+                return Failed("No active mission");
+            if (!TryGetActiveMount(mountId, out Agent mount))
+                return Failed($"Active mount {mountId:N} was not found");
+
+            MBAgentVisuals visuals = mount.AgentVisuals;
+            Skeleton skeleton = visuals?.GetSkeleton();
+            if (ReferenceEquals(visuals, null)
+                || !visuals.IsValid()
+                || ReferenceEquals(skeleton, null)
+                || !skeleton.IsValid)
+            {
+                return Failed($"Mount {mountId:N} has no active skeleton");
+            }
+
+            ObserveMission(mission);
+            EnsureBattleDebugTickBehavior(mission);
+            capturedMount = mount;
+            capturedMountId = mountId;
+            mountPoseCaptureStartTime = mission.CurrentTime;
+            MountPoseSamples.Clear();
+            CaptureMountPoseFrame();
+            return Succeeded($"Capturing rendered horse-head pose for mount {mountId:N}");
+        }
+    }
+
+    public sealed class MountPoseSamplesCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "mount_pose_samples";
+
+        public string Description => "Runs the mount pose samples debug operation.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("mount_agent_id", "The mount agent id.", true),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (!Guid.TryParseExact(args[0], "N", out Guid mountId))
+                return Failed("Invalid command argument value.");
+            if (capturedMount == null || capturedMountId != mountId)
+                return Failed($"No pose capture is active for mount {mountId:N}");
+
+            var output = new StringBuilder();
+            output.Append("mount=").Append(capturedMountId.ToString("N"))
+                .Append(" samples=").Append(MountPoseSamples.Count)
+                .AppendLine();
+            for (int index = 0; index < MountPoseSamples.Count; index++)
+            {
+                MountPoseSample sample = MountPoseSamples[index];
+                output.Append("sample=").Append(index)
+                    .Append(" time=").Append(sample.Time.ToString("0.0000", CultureInfo.InvariantCulture))
+                    .Append(" speed=").Append(sample.Speed.ToString("0.000", CultureInfo.InvariantCulture))
+                    .Append(" action0=").Append(sample.ActionIndex)
+                    .Append(" actionName=").Append(sample.ActionName ?? "none")
+                    .Append(" animation=").Append(sample.AnimationName ?? "none")
+                    .Append(" animationProgress=").Append(sample.AnimationProgress.ToString("0.0000", CultureInfo.InvariantCulture))
+                    .Append(" animationSpeed=").Append(sample.AnimationSpeed.ToString("0.000", CultureInfo.InvariantCulture))
+                    .Append(" turnDirection=").Append(sample.TurnDirection)
+                    .Append(" channelWeight=").Append(sample.ChannelWeight.ToString("0.0000", CultureInfo.InvariantCulture))
+                    .Append(" currentActionWeight=").Append(sample.CurrentActionWeight.ToString("0.0000", CultureInfo.InvariantCulture))
+                    .Append(" headPosition=").Append(sample.HeadPosition.X.ToString("0.00000", CultureInfo.InvariantCulture))
+                    .Append(',').Append(sample.HeadPosition.Y.ToString("0.00000", CultureInfo.InvariantCulture))
+                    .Append(',').Append(sample.HeadPosition.Z.ToString("0.00000", CultureInfo.InvariantCulture))
+                    .Append(" headForward=").Append(sample.HeadForward.X.ToString("0.00000", CultureInfo.InvariantCulture))
+                    .Append(',').Append(sample.HeadForward.Y.ToString("0.00000", CultureInfo.InvariantCulture))
+                    .Append(',').Append(sample.HeadForward.Z.ToString("0.00000", CultureInfo.InvariantCulture))
+                    .AppendLine();
+            }
+            return Succeeded(output.ToString().TrimEnd());
+        }
+    }
+
+    private static void CaptureMountPoseFrame()
+    {
+        UpdateMountCameraFrame();
+
+        Agent mount = capturedMount;
+        Mission mission = Mission.Current;
+        if (mount == null || MountPoseSamples.Count >= MaximumMountPoseSamples)
+            return;
+        if (mission == null
+            || !mount.IsActive()
+            || mount.Mission != mission
+            || observedMission != mission)
+        {
+            capturedMount = null;
+            capturedMountId = Guid.Empty;
+            MountPoseSamples.Clear();
+            return;
+        }
+
+        MBAgentVisuals visuals = mount.AgentVisuals;
+        Skeleton skeleton = visuals?.GetSkeleton();
+        if (ReferenceEquals(visuals, null)
+            || !visuals.IsValid()
+            || ReferenceEquals(skeleton, null)
+            || !skeleton.IsValid)
+        {
+            return;
+        }
+
+        AgentMountData.GetRenderedAction0State(
+            mount,
+            out string animationName,
+            out float animationSpeed,
+            out float animationProgress);
+        int actionIndex = mount.GetCurrentAction(0).Index;
+        string actionName = AgentActionData.GetActionNameWithCode(actionIndex);
+        MatrixFrame headFrame = skeleton.GetBoneEntitialFrameWithName("horse_head");
+        MountPoseSamples.Add(new MountPoseSample
+        {
+            Time = mission.CurrentTime - mountPoseCaptureStartTime,
+            Speed = mount.GetRealGlobalVelocity().AsVec2.Length,
+            ActionIndex = actionIndex,
+            ActionName = actionName,
+            AnimationName = animationName,
+            AnimationProgress = animationProgress,
+            AnimationSpeed = animationSpeed,
+            TurnDirection = AgentMountData.GetTurnDirection(actionName, animationName),
+            ChannelWeight = mount.GetActionChannelWeight(0),
+            CurrentActionWeight = mount.GetActionChannelCurrentActionWeight(0),
+            HeadPosition = headFrame.origin,
+            HeadForward = headFrame.rotation.f
+        });
+    }
+
+    public sealed class MoveCavalryCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "move_cavalry";
+
+        public string Description => "Runs the move cavalry debug operation.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("distance", "The distance.", true),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (!float.TryParse(
+                    args[0],
+                    NumberStyles.Float,
+                    CultureInfo.InvariantCulture,
+                    out float distance)
+                || distance < 5f
+                || distance > 100f)
+            {
+                return Failed("Invalid command argument value.");
+            }
+
+            var mission = Mission.Current;
+            var controller = mission?.GetMissionBehavior<CoopBattleController>();
+            if (mission == null || controller == null)
+                return Failed("No active coop battle mission");
+            if (!controller.Session.IsLocalHost)
+                return Failed("Run this command on the battle-host client");
+            if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry))
+                return Failed("Network agent registry is unavailable");
+
+            Agent[] riders = GetBattleHostCavalryRiders(
+                mission,
+                controller,
+                registry);
+            Formation[] formations = riders
+                .Select(agent => agent.Formation)
+                .Distinct()
+                .ToArray();
+            if (formations.Length == 0)
+                return Failed("The battle host has no active cavalry formations");
+
+            foreach (Agent rider in riders)
+            {
+                RestoreCavalryController(rider);
+                if (rider.MountAgent != null)
+                    RestoreCavalryController(rider.MountAgent);
+                rider.SetScriptedFlags(Agent.AIScriptedFrameFlags.None);
+                rider.SetMaximumSpeedLimit(-1f, isMultiplier: false);
+                rider.MountAgent?.SetMaximumSpeedLimit(-1f, isMultiplier: false);
+                rider.SetIsAIPaused(false);
+                rider.MountAgent?.SetIsAIPaused(false);
+            }
+
+            foreach (Formation formation in formations)
+            {
+                Vec2 direction = formation.Direction;
+                if (direction.LengthSquared <= 0.0001f)
+                    direction = Vec2.Forward;
+                else
+                    direction.Normalize();
+
+                WorldPosition destination = formation.CachedMedianPosition;
+                destination.SetVec2(formation.CurrentPosition + (direction * distance));
+                formation.SetMovementOrder(MovementOrder.MovementOrderMove(destination));
+            }
+
+            return Succeeded($"Moved {formations.Length} battle-host cavalry formations {distance:0.0} meters");
+        }
+    }
+
+    public sealed class HoldCavalryCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "hold_cavalry";
+
+        public string Description => "Runs the hold cavalry debug operation.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            var mission = Mission.Current;
+            var controller = mission?.GetMissionBehavior<CoopBattleController>();
+            if (mission == null || controller == null)
+                return Failed("No active coop battle mission");
+            if (!controller.Session.IsLocalHost)
+                return Failed("Run this command on the battle-host client");
+            if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry))
+                return Failed("Network agent registry is unavailable");
+
+            Agent[] riders = GetBattleHostCavalryRiders(
+                mission,
+                controller,
+                registry);
+            Formation[] formations = riders
+                .Select(agent => agent.Formation)
+                .Distinct()
+                .ToArray();
+            if (formations.Length == 0)
+                return Failed("The battle host has no active cavalry formations");
+
+            foreach (Formation formation in formations)
+                formation.SetMovementOrder(MovementOrder.MovementOrderStop);
+            foreach (Agent rider in riders)
+            {
+                FreezeCavalryController(rider);
+                rider.SetMaximumSpeedLimit(0f, isMultiplier: false);
+                rider.MovementInputVector = Vec2.Zero;
+                rider.SetIsAIPaused(true);
+                if (rider.MountAgent != null)
+                {
+                    FreezeCavalryController(rider.MountAgent);
+                    rider.MountAgent.SetMaximumSpeedLimit(0f, isMultiplier: false);
+                    rider.MountAgent.MovementInputVector = Vec2.Zero;
+                    rider.MountAgent.SetIsAIPaused(true);
+                }
+            }
+
+            return Succeeded($"Stopped {formations.Length} battle-host cavalry formations");
+        }
+    }
+
+    public sealed class TurnCavalryCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "turn_cavalry";
+
+        public string Description => "Runs the turn cavalry debug operation.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("degrees", "The degrees.", true),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (!float.TryParse(
+                    args[0],
+                    NumberStyles.Float,
+                    CultureInfo.InvariantCulture,
+                    out float degrees)
+                || float.IsNaN(degrees)
+                || float.IsInfinity(degrees)
+                || Math.Abs(degrees) < 1f
+                || Math.Abs(degrees) > 180f)
+            {
+                return Failed("Invalid command argument value.");
+            }
+
+            var mission = Mission.Current;
+            var controller = mission?.GetMissionBehavior<CoopBattleController>();
+            if (mission == null || controller == null)
+                return Failed("No active coop battle mission");
+            if (!controller.Session.IsLocalHost)
+                return Failed("Run this command on the battle-host client");
+            if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry))
+                return Failed("Network agent registry is unavailable");
+
+            Agent[] riders = GetBattleHostCavalryRiders(
+                mission,
+                controller,
+                registry);
+            Formation[] formations = riders
+                .Select(agent => agent.Formation)
+                .Distinct()
+                .ToArray();
+            if (formations.Length == 0)
+                return Failed("The battle host has no active cavalry formations");
+
+            float radians = degrees * ((float)Math.PI / 180f);
+            float cosine = (float)Math.Cos(radians);
+            float sine = (float)Math.Sin(radians);
+            foreach (Formation formation in formations)
+                formation.SetMovementOrder(MovementOrder.MovementOrderStop);
+
+            foreach (Agent rider in riders)
+            {
+                Vec2 riderDirection = rider.GetMovementDirection();
+                var turnedRiderDirection = new Vec2(
+                    (riderDirection.X * cosine) - (riderDirection.Y * sine),
+                    (riderDirection.X * sine) + (riderDirection.Y * cosine));
+                rider.SetMovementDirection(in turnedRiderDirection);
+
+                Agent mount = rider.MountAgent;
+                if (mount != null)
+                {
+                    Vec2 mountDirection = mount.GetMovementDirection();
+                    var turnedMountDirection = new Vec2(
+                        (mountDirection.X * cosine) - (mountDirection.Y * sine),
+                        (mountDirection.X * sine) + (mountDirection.Y * cosine));
+                    mount.SetMovementDirection(in turnedMountDirection);
+                }
+            }
+
+            return Succeeded($"Turned {formations.Length} battle-host cavalry formations {degrees:0.0} degrees in place");
+        }
+    }
+
+    private static void FreezeCavalryController(Agent rider)
+    {
+        if (!CavalryControllers.ContainsKey(rider))
+            CavalryControllers.Add(rider, rider.Controller);
+        rider.Controller = AgentControllerType.None;
+    }
+
+    private static void RestoreCavalryController(Agent rider)
+    {
+        if (!CavalryControllers.TryGetValue(rider, out AgentControllerType controller))
+            return;
+
+        rider.Controller = controller;
+        CavalryControllers.Remove(rider);
+    }
+
+    private static Agent[] GetBattleHostCavalryRiders(
+        Mission mission,
+        CoopBattleController controller,
+        INetworkAgentRegistry registry)
+    {
+        ObserveMission(mission);
+        return registry.GetAgents(controller.Session.OwnControllerId)
+            .Where(info => info.OriginalOwner == controller.Session.OwnControllerId)
+            .Select(info => info.Agent)
+            .Where(agent => agent != null
+                && agent.IsActive()
+                && !agent.IsMount
+                && agent.HasMount
+                && agent.Team == mission.PlayerTeam
+                && agent.Formation != null)
+            .ToArray();
+    }
+
+    private static void ObserveMission(Mission mission)
+    {
+        if (observedMission == mission)
+            return;
+
+        EnemyPositions.Clear();
+        ownDamageEvents = 0;
+        CavalryControllers.Clear();
+        capturedMount = null;
+        capturedMountId = Guid.Empty;
+        MountPoseSamples.Clear();
+        ReleaseLadderCamera();
+        ReleaseMountCamera();
+        observedMission = mission;
+    }
+
+    private static void EnsureBattleDebugTickBehavior(Mission mission)
+    {
+        if (!ReferenceEquals(battleDebugTickBehavior, null)
+            && ReferenceEquals(battleDebugTickBehavior.Mission, mission))
+        {
+            return;
+        }
+
+        battleDebugTickBehavior = new BattleDebugTickBehavior();
+        mission.AddMissionBehavior(battleDebugTickBehavior);
+    }
+
+    private static bool TryGetActiveMount(Guid mountId, out Agent mount)
+    {
+        mount = null;
+        if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry)
+            || !registry.TryGetAgentInfo(mountId, out var info)
+            || info.Agent == null
+            || !info.Agent.IsMount
+            || !info.Agent.IsActive())
+        {
+            return false;
+        }
+
+        mount = info.Agent;
+        return true;
+    }
+
+    private static bool MatchesAuthority(
+        IBattleSession session,
+        CoopAgentInfo info,
+        string filter,
+        Team playerTeam)
+    {
+        if (string.IsNullOrEmpty(filter)) return true;
+        if (filter == "host") return session.IsHostController(info.CurrentAuthority);
+        if (filter == "host-player-team")
+            return session.IsHostController(info.CurrentAuthority)
+                && info.OriginalOwner == info.CurrentAuthority
+                && info.Agent?.RiderAgent?.IsActive() == true
+                && info.Agent.RiderAgent.Team?.Side == playerTeam?.Side;
+        if (filter == "local") return session.IsOwn(info.CurrentAuthority);
+        return info.CurrentAuthority == filter;
+    }
+
+    public sealed class FocusMountCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "focus_mount";
+
+        public string Description => "Runs the focus mount debug operation.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("mount_agent_id", "The mount agent id.", true),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (!Guid.TryParseExact(args[0], "N", out Guid mountId))
+                return Failed("Invalid command argument value.");
+
+            var mission = Mission.Current;
+            if (mission == null)
+                return Failed("No active mission");
+            if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var registry))
+                return Failed("Network agent registry is unavailable");
+            if (!registry.TryGetAgentInfo(mountId, out var info)
+                || info.Agent == null
+                || !info.Agent.IsMount
+                || !info.Agent.IsActive())
+            {
+                return Failed($"Active mount {mountId:N} was not found");
+            }
+
+            if (!(ScreenManager.TopScreen is MissionScreen missionScreen)
+                || ReferenceEquals(missionScreen.CombatCamera, null))
+                return Failed("The mission screen is not active");
+
+            ReleaseLadderCamera();
+            ObserveMission(mission);
+            Agent mount = info.Agent;
+            MBAgentVisuals visuals = mount.AgentVisuals;
+            GameEntity visualEntity = visuals?.GetEntity();
+            if (ReferenceEquals(visualEntity, null))
+                return Failed($"Mount {mountId:N} has no active visual entity");
+
+            EnsureBattleDebugTickBehavior(mission);
+
+            if (ReferenceEquals(mountCamera, null)
+                || ReferenceEquals(mountCamera.Entity, null))
+            {
+                ReleaseMountCamera();
+                mountCamera = Camera.CreateCamera();
+                mountCamera.FillParametersFrom(missionScreen.CombatCamera);
+                var localTarget = new Vec3(0f, 0f, 1.4f);
+                var localPosition = new Vec3(-4f, -11f, 5.4f);
+                mountCamera.LookAt(localPosition, localTarget, Vec3.Up);
+                mountCameraLocalFrame = mountCamera.Frame;
+                mountCamera.Entity = GameEntity.CreateEmpty(
+                    mission.Scene,
+                    isModifiableFromEditor: false,
+                    createPhysics: false,
+                    callScriptCallbacks: false);
+            }
+
+            focusedMount = mount;
+            focusedMountId = mountId;
+            UpdateMountCameraFrame();
+            missionScreen.CustomCamera = mountCamera;
+
+            return Succeeded($"Focused the mission camera on mount {mountId:N}");
+        }
+    }
+
+    public sealed class MountCameraStateCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "mount_camera_state";
+
+        public string Description => "Reports mount camera state.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (ReferenceEquals(mountCamera, null)
+                || ReferenceEquals(focusedMount, null)
+                || !focusedMount.IsActive()
+                || !(ScreenManager.TopScreen is MissionScreen missionScreen)
+                || ReferenceEquals(missionScreen.CombatCamera, null)
+                || ReferenceEquals(mountCamera.Entity, null))
+            {
+                return Succeeded("active=False");
+            }
+
+            MatrixFrame cameraEntityFrame = mountCamera.Entity.GetGlobalFrame();
+            Vec3 renderedPosition = missionScreen.CombatCamera.Position;
+            Vec3 entityDirection = -cameraEntityFrame.rotation.u;
+            entityDirection.Normalize();
+            Vec3 renderedDirection = missionScreen.CombatCamera.Direction;
+            float directionDot =
+                (renderedDirection.X * entityDirection.X)
+                + (renderedDirection.Y * entityDirection.Y)
+                + (renderedDirection.Z * entityDirection.Z);
+
+            float positionDelta =
+                (renderedPosition - cameraEntityFrame.origin).Length;
+            bool active = ReferenceEquals(missionScreen.CustomCamera, mountCamera);
+            return Succeeded(string.Format(
+                CultureInfo.InvariantCulture,
+                "active={0} mount={1:N} positionDelta={2:F3} directionDot={3:F3}",
+                active,
+                focusedMountId,
+                positionDelta,
+                directionDot));
+        }
+    }
+
+    private static bool UpdateMountCameraFrame()
+    {
+        if (ReferenceEquals(mountCamera, null)
+            || ReferenceEquals(mountCamera.Entity, null)
+            || ReferenceEquals(focusedMount, null)
+            || !focusedMount.IsActive())
+        {
+            return false;
+        }
+
+        GameEntity visualEntity = focusedMount.AgentVisuals?.GetEntity();
+        if (ReferenceEquals(visualEntity, null))
+            return false;
+
+        MatrixFrame visualFrame = visualEntity.GetGlobalFrame();
+        MatrixFrame localFrame = mountCameraLocalFrame;
+        MatrixFrame globalFrame = visualFrame.TransformToParent(in localFrame);
+        mountCamera.Entity.SetGlobalFrame(globalFrame);
+        return true;
+    }
+
+    public sealed class ReleaseMountCameraCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "release_mount_camera";
+
+        public string Description => "Restores or clears release mount camera.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            bool released = ReleaseMountCamera();
+            return released
+                ? Succeeded("Released the mount camera")
+                : Failed("No mount camera was active");
+        }
+    }
+
+    private static bool ReleaseMountCamera()
+    {
+        if (ReferenceEquals(mountCamera, null)) return false;
+
+        if (ScreenManager.TopScreen is MissionScreen missionScreen
+            && ReferenceEquals(missionScreen.CustomCamera, mountCamera))
+        {
+            missionScreen.CustomCamera = null;
+        }
+
+        if (ReferenceEquals(mountCamera.Entity, null))
+            mountCamera.ReleaseCamera();
+        else
+            mountCamera.ReleaseCameraEntity();
+        mountCamera = null;
+        focusedMount = null;
+        focusedMountId = Guid.Empty;
+        return true;
+    }
+
+    public sealed class LadderStateCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "ladder_state";
+
+        public string Description => "Reports ladder state.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("machine_id", "The machine id.", false),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if ((args.Count == 1 && !int.TryParse(args[0], out _)))
+            {
+                return Failed("Invalid command argument value.");
+            }
+
+            var mission = Mission.Current;
+            if (mission == null || !mission.IsSiegeBattle)
+            {
+                return Failed("No active siege mission");
+            }
+
+            if (!ContainerProvider.TryResolve<INetworkAgentRegistry>(out var agentRegistry))
+            {
+                return Failed("Unable to resolve NetworkAgentRegistry");
+            }
+
+            int? selectedId = args.Count == 1 ? int.Parse(args[0]) : null;
+            var ladders = mission.MissionObjects
+                .OfType<SiegeLadder>()
+                .Where(ladder => selectedId == null || ladder.Id.Id == selectedId.Value)
+                .OrderBy(ladder => ladder.Id.Id)
+                .ToArray();
+            if (ladders.Length == 0)
+            {
+                return Failed(selectedId == null
+                    ? "No siege ladders are registered"
+                    : $"Siege ladder {selectedId.Value} was not found");
+            }
+
+            var output = new StringBuilder();
+            output.AppendLine($"ladders={ladders.Length} authority={SiegeMissionAuthorityGate.IsLocalAuthority} " +
+                $"known={SiegeMissionAuthorityGate.IsAuthorityKnown}");
+            foreach (var ladder in ladders)
+            {
+                int animationIndex = ladder._ladderSkeleton.GetAnimationIndexAtChannel(0);
+                float animationProgress = animationIndex >= 0
+                    ? ladder._ladderSkeleton.GetAnimationParameterAtChannel(0)
+                    : 0f;
+
+                var users = new List<string>();
+                int deactivatedPoints = 0;
+                foreach (var standingPoint in ladder.StandingPoints)
+                {
+                    if (standingPoint.IsDeactivated) deactivatedPoints++;
+
+                    var agent = standingPoint.UserAgent ?? standingPoint.MovingAgent;
+                    if (agent == null) continue;
+
+                    string role = standingPoint.GameEntity.HasTag(ladder.AttackerTag)
+                        ? "attacker"
+                        : standingPoint.GameEntity.HasTag(ladder.DefenderTag) ? "defender" : "other";
+                    string controller = agentRegistry.TryGetAgentInfo(agent, out var info)
+                        ? info.CurrentAuthority
+                        : "unregistered";
+                    users.Add($"{role}:{controller}:{agent.Index}");
+                }
+
+                output.AppendLine($"ladder={ladder.Id.Id:D5} state={ladder.State} animation={ladder._animationState} " +
+                    $"animationIndex={animationIndex} progress={animationProgress:0.000} " +
+                    $"simLocal={SiegeMissionAuthorityGate.IsMachineSimulatedLocally(ladder.Id.Id)} " +
+                    $"points={ladder.StandingPoints.Count} pointsOff={deactivatedPoints} " +
+                    $"users={(users.Count > 0 ? string.Join(",", users) : "none")}");
+            }
+
+            return Succeeded(output.ToString());
+        }
+    }
+
+    public sealed class FocusLadderCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "focus_ladder";
+
+        public string Description => "Runs the focus ladder debug operation.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("machine_id", "The machine id.", true),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (!int.TryParse(args[0], out int machineId))
+            {
+                return Failed("Invalid command argument value.");
+            }
+
+            var mission = Mission.Current;
+            var ladder = mission?.MissionObjects
+                .OfType<SiegeLadder>()
+                .FirstOrDefault(candidate => candidate.Id.Id == machineId);
+            if (ladder == null)
+            {
+                return Failed($"Siege ladder {machineId} was not found");
+            }
+
+            if (!(ScreenManager.TopScreen is MissionScreen missionScreen) || missionScreen.CombatCamera == null)
+            {
+                return Failed("The mission screen is not active");
+            }
+
+            ReleaseMountCamera();
+            ReleaseLadderCamera();
+            ladderCamera = Camera.CreateCamera();
+            ladderCamera.FillParametersFrom(missionScreen.CombatCamera);
+
+            var frame = ladder.GameEntity.GetGlobalFrame();
+            var target = frame.origin + (Vec3.Up * 2.5f);
+            var position = target - (frame.rotation.f * 12f) + (Vec3.Up * 4f);
+            ladderCamera.LookAt(position, target, Vec3.Up);
+            missionScreen.CustomCamera = ladderCamera;
+
+            return Succeeded($"Focused the mission camera on siege ladder {machineId}");
+        }
+    }
+
+    public sealed class ReleaseLadderCameraCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.battle";
+
+        public string Name => "release_ladder_camera";
+
+        public string Description => "Restores or clears release ladder camera.";
+
+        public CoopCommandSide Side => CoopCommandSide.Both;
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            bool released = ReleaseLadderCamera();
+            return released
+                ? Succeeded("Released the ladder camera")
+                : Failed("No ladder camera was active");
+        }
+    }
+
+    private static bool ReleaseLadderCamera()
+    {
+        if (ladderCamera == null) return false;
+
+        if (ScreenManager.TopScreen is MissionScreen missionScreen
+            && missionScreen.CustomCamera == ladderCamera)
+        {
+            missionScreen.CustomCamera = null;
+        }
+
+        ladderCamera.ReleaseCamera();
+        ladderCamera = null;
+        return true;
+    }
+}
+
+internal sealed class DebugReplicationFixtureAgentOrigin : CoopAgentOrigin
+{
+    public DebugReplicationFixtureAgentOrigin(
+        CharacterObject troop,
+        PartyBase party,
+        int rank,
+        Banner banner,
+        UniqueTroopDescriptor descriptor)
+        : base(troop, party, rank, banner, descriptor)
+    {
+    }
+}
+
+internal static class DefenderMissionAcknowledgementContract
+{
+    internal static bool IsReady(
+        bool isClient,
+        bool missionActive,
+        bool activeCoopSiegeAssault,
+        BattleSideEnum battleSide,
+        bool localMainAgent,
+        bool deploymentCommitted,
+        bool controllerReady) =>
+        isClient && missionActive && activeCoopSiegeAssault &&
+        battleSide == BattleSideEnum.Defender && localMainAgent &&
+        deploymentCommitted && controllerReady;
+}

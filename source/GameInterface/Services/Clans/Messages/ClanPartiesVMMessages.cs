@@ -1,0 +1,45 @@
+﻿using Common.Messaging;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.Party;
+
+namespace GameInterface.Services.Clans.Messages;
+
+public readonly struct NewClanPartyCreated : IEvent
+{
+    public readonly Hero MainHero;
+    public readonly Hero NewLeader;
+    public readonly Clan TargetClan;
+    public readonly int PartyGoldLowerThreshold;
+
+    public NewClanPartyCreated(
+        Hero mainHero,
+        Hero newLeader,
+        Clan targetClan,
+        int partyGoldLowerThreshold)
+    {
+        MainHero = mainHero;
+        NewLeader = newLeader;
+        TargetClan = targetClan;
+        PartyGoldLowerThreshold = partyGoldLowerThreshold;
+    }
+}
+
+public readonly struct ClanPartyLeaderChanged : IEvent
+{
+    public readonly Hero MainHero;
+    public readonly Hero NewLeader;
+    public readonly MobileParty SelectedParty;
+    public readonly MobileParty MainParty;
+
+    public ClanPartyLeaderChanged(
+        Hero mainHero,
+        Hero newLeader,
+        MobileParty selectedParty,
+        MobileParty mainParty)
+    {
+        MainHero = mainHero;
+        NewLeader = newLeader;
+        SelectedParty = selectedParty;
+        MainParty = mainParty;
+    }
+}

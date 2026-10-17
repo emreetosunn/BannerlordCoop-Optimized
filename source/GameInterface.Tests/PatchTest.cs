@@ -1,0 +1,103 @@
+﻿using Common.Util;
+using HarmonyLib;
+using GameInterface.Services.MobileParties.Patches;
+using GameInterface.Tests.Services.SiegeEvents;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.CampaignBehaviors;
+using TaleWorlds.CampaignSystem.Party;
+using TaleWorlds.CampaignSystem.Siege;
+using Xunit;
+
+namespace GameInterface.Tests
+{
+    [Collection(nameof(CampaignCurrentCollection))]
+    public class PatchTest
+    {
+        // PatchAll leaves these categories to boot and game start, so E2E environments never apply them.
+        [Theory]
+        [InlineData(GameInterface.HARMONY_GAME_STARTED_CATEGORY)]
+        [InlineData(GameInterface.HARMONY_UI_LOADING_CATEGORY)]
+        public void LateCategoryPatches_ApplyToCurrentGameAssemblies(string category)
+        {
+            var harmony = new Harmony($"{nameof(LateCategoryPatches_ApplyToCurrentGameAssemblies)}.{category}");
+
+            try
+            {
+                harmony.PatchCategory(typeof(GameInterface).Assembly, category);
+
+                Assert.NotEmpty(harmony.GetPatchedMethods());
+            }
+            finally
+            {
+                harmony.UnpatchAll(harmony.Id);
+            }
+        }
+
+        [Fact]
+        public void PlayerLeaveSiegeEncounterPatch_HooksDontGetInvolved()
+        {
+            var harmony = new Harmony(nameof(PlayerLeaveSiegeEncounterPatch_HooksDontGetInvolved));
+            try
+            {
+                var patched = harmony.CreateClassProcessor(typeof(PlayerLeaveSiegeEncounterPatch)).Patch();
+
+                Assert.Contains(
+                    patched,
+                    method => method.Name.Contains(nameof(EncounterGameMenuBehavior.break_in_leave_consequence)));
+            }
+            finally
+            {
+                harmony.UnpatchAll(harmony.Id);
+            }
+        }
+
+        [Fact]
+        public void PlayerLeaveSettlementPatch_PatchesVillageHostileActionLeaveOptions()
+        {
+            var harmony = new Harmony(nameof(PlayerLeaveSettlementPatch_PatchesVillageHostileActionLeaveOptions));
+            try
+            {
+                var patched = harmony.CreateClassProcessor(typeof(PlayerLeaveSettlementPatch)).Patch();
+
+                Assert.Contains(patched, method => method.Name.Contains("game_menu_village_hostile_action_warn_leave_on_consequence"));
+                Assert.Contains(patched, method => method.Name.Contains("village_looted_leave_on_consequence"));
+            }
+            finally
+            {
+                harmony.UnpatchAll(harmony.Id);
+            }
+        }
+
+        [Fact]
+        public void PlayerLeaveSiegeEncounterPatch_NeutralPartyRequestsSynchronizedLeave()
+        {
+            var party = ObjectHelper.SkipConstructor<MobileParty>();
+
+            Assert.True(PlayerLeaveSiegeEncounterPatch.ShouldRequestLeave(party));
+        }
+
+        [Fact]
+        public void PlayerLeaveSiegeEncounterPatch_SiegeParticipantUsesVanillaCleanup()
+        {
+            var party = ObjectHelper.SkipConstructor<MobileParty>();
+            var besiegerCamp = ObjectHelper.SkipConstructor<BesiegerCamp>();
+            besiegerCamp.SiegeEvent = ObjectHelper.SkipConstructor<SiegeEvent>();
+            party._besiegerCamp = besiegerCamp;
+
+            Assert.False(PlayerLeaveSiegeEncounterPatch.ShouldRequestLeave(party));
+        }
+
+        [Fact]
+        public void PlayerLeaveSiegeEncounterPatch_ArmyFollowerUsesVanillaCleanup()
+        {
+            var party = ObjectHelper.SkipConstructor<MobileParty>();
+            var leader = ObjectHelper.SkipConstructor<MobileParty>();
+            var army = ObjectHelper.SkipConstructor<Army>();
+            army.LeaderParty = leader;
+            party._army = army;
+
+            Assert.False(PlayerLeaveSiegeEncounterPatch.ShouldRequestLeave(party));
+        }
+    }
+
+}

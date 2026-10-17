@@ -1,0 +1,42 @@
+﻿using Autofac;
+using Common.Serialization;
+using GameInterface.Serialization;
+using GameInterface.Serialization.External;
+using GameInterface.Tests.Bootstrap.Modules;
+using TaleWorlds.CampaignSystem.CharacterDevelopment;
+using Xunit;
+
+namespace GameInterface.Tests.Serialization.SerializerTests
+{
+    public class PerkObjectSerializationTest
+    {
+        ILifetimeScope container;
+        public PerkObjectSerializationTest()
+        {
+            container = SerializationTestContainer.BeginScope();
+        }
+
+        [Fact]
+        public void PerkObject_Full_Serialization()
+        {
+            PerkObject testPerkObject = new PerkObject("test");
+
+            var factory = container.Resolve<IBinaryPackageFactory>();
+            PerkObjectBinaryPackage package = new PerkObjectBinaryPackage(testPerkObject, factory);
+
+            package.Pack();
+
+            byte[] bytes = BinaryPackageSerializer.Serialize(package);
+
+            Assert.NotEmpty(bytes);
+
+            object obj = BinaryPackageSerializer.Deserialize(bytes);
+
+            Assert.IsType<PerkObjectBinaryPackage>(obj);
+
+            PerkObjectBinaryPackage returnedPackage = (PerkObjectBinaryPackage)obj;
+
+            Assert.Equal(returnedPackage.StringId, package.StringId);
+        }
+    }
+}

@@ -1,0 +1,95 @@
+﻿using Common;
+using Common.Logging;
+using Common.Messaging;
+using Common.Network;
+using Common.Util;
+using GameInterface.Services.MobilePartyAIs.Messages;
+using GameInterface.Services.ObjectManager;
+using HarmonyLib;
+using Serilog;
+using TaleWorlds.CampaignSystem.Party;
+
+namespace GameInterface.Services.MobilePartyAIs.Handlers;
+internal class MobilePartyAiLifetimeHandler : IHandler
+{
+    private static readonly ILogger Logger = LogManager.GetLogger<MobilePartyAiLifetimeHandler>();
+
+    private readonly IMessageBroker messageBroker;
+    private readonly IObjectManager objectManager;
+    private readonly INetwork network;
+
+    public MobilePartyAiLifetimeHandler(IMessageBroker messageBroker, IObjectManager objectManager, INetwork network)
+    {
+        this.messageBroker = messageBroker;
+        this.objectManager = objectManager;
+        this.network = network;
+
+        messageBroker.Subscribe<MobilePartyAiCreated>(Handle_MobilePartyAiCreated);
+        messageBroker.Subscribe<NetworkCreateMobilePartyAi>(Handle_NetworkCreateMobilePartyAi);
+
+        messageBroker.Subscribe<MobilePartyAiDestroyed>(Handle_MobilePartyAiDestroyed);
+        messageBroker.Subscribe<NetworkDestroyMobilePartyAi>(Handle_NetworkDestroyMobilePartyAi);
+    }
+
+    public void Dispose()
+    {
+        messageBroker.Unsubscribe<MobilePartyAiCreated>(Handle_MobilePartyAiCreated);
+        messageBroker.Unsubscribe<NetworkCreateMobilePartyAi>(Handle_NetworkCreateMobilePartyAi);
+
+        messageBroker.Unsubscribe<MobilePartyAiDestroyed>(Handle_MobilePartyAiDestroyed);
+        messageBroker.Unsubscribe<NetworkDestroyMobilePartyAi>(Handle_NetworkDestroyMobilePartyAi);
+    }
+
+    private void Handle_MobilePartyAiCreated(MessagePayload<MobilePartyAiCreated> payload)
+    {
+        // Save loading constructs AI attachments before InitialServerState registers campaign objects.
+        // MobilePartyAiRegistry registers those existing attachments after loading.
+        if (!objectManager.TryGetHandle(payload.What.Party, out var partyHandle)) return;
+
+        if (!objectManager.AddNewObject(payload.What.Instance, out var partyAiId)) return;
+        if (!objectManager.TryGetHandleWithLogging(payload.What.Instance, out var partyAiHandle)) return;
+
+        network.SendAll(new NetworkCreateMobilePartyAi(partyAiId, partyAiHandle, partyHandle));
+    }
+
+
+    private void Handle_NetworkCreateMobilePartyAi(MessagePayload<NetworkCreateMobilePartyAi> payload)
+    {
+        var partyId = payload.What.PartyId;
+        var aiId = payload.What.MobilePartyAiId;
+
+        GameThread.RunSafe(() =>
+        {
+            if (!objectManager.TryGetObjectWithLogging<MobileParty>(partyId, out var party)) return;
+
+            var newAi = ObjectHelper.SkipConstructor<MobilePartyAi>();
+            AccessTools.Field(typeof(MobilePartyAi), nameof(MobilePartyAi._mobileParty)).SetValue(newAi, party);
+
+            objectManager.AddExisting(aiId, newAi, payload.What.MobilePartyAiHandle);
+        }, context: nameof(Handle_NetworkCreateMobilePartyAi));
+    }
+
+    private void Handle_MobilePartyAiDestroyed(MessagePayload<MobilePartyAiDestroyed> payload)
+    {
+        var ai = payload.What.Instance;
+
+        if (objectManager.TryGetHandle(ai, out var aiId) == false) return;
+
+        network.SendAll(new NetworkDestroyMobilePartyAi(aiId));
+    }
+
+    private void Handle_NetworkDestroyMobilePartyAi(MessagePayload<NetworkDestroyMobilePartyAi> payload)
+    {
+        var aiId = payload.What.MobilePartyAiId;
+
+        GameThread.RunSafe(() =>
+        {
+            if (!objectManager.TryGetObjectWithLogging<MobilePartyAi>(aiId, out var ai)) return;
+
+            if (!objectManager.Remove(ai))
+            {
+                Logger.Error("Failed to remove Ai with id {id} from object manager", aiId);
+            }
+        }, context: nameof(Handle_NetworkDestroyMobilePartyAi));
+    }
+}

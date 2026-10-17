@@ -1,0 +1,205 @@
+﻿using Autofac;
+using Common.Messaging;
+using Common.Network.Messages;
+using Coop.Core.Server.Connections;
+using Coop.Core.Server.Connections.Messages;
+using Coop.Core.Server.Connections.States;
+using Coop.Tests.Mocks;
+using LiteNetLib;
+using GameInterface.Services.Players;
+using Moq;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace Coop.Tests.Server.Connections.States
+{
+    public class ConnectionCollectionTests
+    {
+        private readonly ConnectionCollection connectionCollection;
+        private readonly NetPeer playerPeer;
+        private readonly ServerTestComponent serverComponent;
+
+        public ConnectionCollectionTests(ITestOutputHelper output)
+        {
+            serverComponent = new ServerTestComponent(output);
+
+            var container = serverComponent.Container;
+            var network = container.Resolve<TestNetwork>();
+
+            playerPeer = network.CreatePeer();
+
+            connectionCollection = container.Resolve<ConnectionCollection>();
+        }
+
+        [Fact]
+        public void CampaignSynchronization_ResolvesTheLiveConnectionCollection()
+        {
+            var synchronization = serverComponent.Container.Resolve<ICampaignSynchronization>();
+            Assert.Same(connectionCollection, synchronization);
+            Assert.Same(serverComponent.Container.Resolve<IConnectionCollection>(), synchronization);
+
+            connectionCollection.PlayerJoiningHandler(new MessagePayload<PlayerConnected>(this, new PlayerConnected(playerPeer)));
+            connectionCollection.ConnectionStates[playerPeer].SetState<LoadingState>();
+            Assert.False(synchronization.HasCompletedCampaignSynchronization(playerPeer));
+            connectionCollection.ConnectionStates[playerPeer].SetState<CampaignState>();
+            Assert.True(synchronization.HasCompletedCampaignSynchronization(playerPeer));
+        }
+
+        [Fact]
+        public void PlayerDisconnected_RemovePlayer()
+        {
+            // Arrange
+            var connectPayload = new MessagePayload<PlayerConnected>(this, new PlayerConnected(playerPeer));
+            var disconnectPayload = new MessagePayload<PlayerDisconnected>(this, new PlayerDisconnected(playerPeer, default));
+
+            // Act
+            connectionCollection.PlayerJoiningHandler(connectPayload);
+            Assert.Single(connectionCollection.ConnectionStates);
+            connectionCollection.PlayerDisconnectedHandler(disconnectPayload);
+
+            // Assert
+            Assert.Empty(connectionCollection.ConnectionStates);
+        }
+
+        [Fact]
+        public void PlayerDisconnected_LoadingPlayerClearsUnpauseBlock()
+        {
+            // Arrange
+            var connectPayload = new MessagePayload<PlayerConnected>(this, new PlayerConnected(playerPeer));
+            var disconnectPayload = new MessagePayload<PlayerDisconnected>(this, new PlayerDisconnected(playerPeer, default));
+
+            // Act
+            connectionCollection.PlayerJoiningHandler(connectPayload);
+            connectionCollection.ConnectionStates[playerPeer].SetState<TransferSaveState>();
+            Assert.NotEmpty(connectionCollection.LoadingPeers);
+            connectionCollection.PlayerDisconnectedHandler(disconnectPayload);
+
+            // Assert
+            Assert.Empty(connectionCollection.LoadingPeers);
+        }
+
+        [Fact]
+        public void PlayerPlayerConnected_AddsNewPlayer()
+        {
+            // Arrange
+            var connectPayload = new MessagePayload<PlayerConnected>(this, new PlayerConnected(playerPeer));
+            
+            // Act
+            connectionCollection.PlayerJoiningHandler(connectPayload);
+
+            // Assert
+            var connectionState = Assert.Single(connectionCollection.ConnectionStates).Value;
+            Assert.IsType<ResolveCharacterState>(connectionState.State);
+        }
+
+        [Fact]
+        public void ConnectedPlayers_BroadcastsAfterSuccessfulChangesOnly()
+        {
+            var connectPayload = new MessagePayload<PlayerConnected>(this, new PlayerConnected(playerPeer));
+            var disconnectPayload = new MessagePayload<PlayerDisconnected>(this,
+                new PlayerDisconnected(playerPeer, default));
+            serverComponent.TestMessageBroker.Messages.Clear();
+
+            connectionCollection.PlayerJoiningHandler(connectPayload);
+
+            var connected = Assert.Single(
+                serverComponent.TestMessageBroker.GetMessagesFromType<ConnectedPlayersChanged>());
+            Assert.Equal(1, connected.ConnectedPlayers);
+
+            serverComponent.TestMessageBroker.Messages.Clear();
+            connectionCollection.PlayerJoiningHandler(connectPayload);
+            Assert.Empty(serverComponent.TestMessageBroker.GetMessagesFromType<ConnectedPlayersChanged>());
+
+            serverComponent.TestMessageBroker.Messages.Clear();
+            connectionCollection.PlayerDisconnectedHandler(disconnectPayload);
+            var disconnected = Assert.Single(
+                serverComponent.TestMessageBroker.GetMessagesFromType<ConnectedPlayersChanged>());
+            Assert.Equal(0, disconnected.ConnectedPlayers);
+
+            serverComponent.TestMessageBroker.Messages.Clear();
+            connectionCollection.PlayerDisconnectedHandler(disconnectPayload);
+            Assert.Empty(serverComponent.TestMessageBroker.GetMessagesFromType<ConnectedPlayersChanged>());
+        }
+
+        [Fact]
+        public void PlayersLoading_BlockedUntilPlayerEntersCampaign()
+        {
+            // Arrange
+            var connectPayload = new MessagePayload<PlayerConnected>(this, new PlayerConnected(playerPeer));
+            connectionCollection.PlayerJoiningHandler(connectPayload);
+            var connectionLogic = connectionCollection.ConnectionStates[playerPeer];
+
+            // Assert
+            // Character resolution/creation happen before the save snapshot is taken,
+            // so time is free to unpause during them.
+            Assert.Empty(connectionCollection.LoadingPeers);
+
+            connectionLogic.SetState<CreateCharacterState>();
+            Assert.Empty(connectionCollection.LoadingPeers);
+
+            // The save is packaged in TransferSaveState and consumed through LoadingState,
+            // so time must stay locked across that window.
+            connectionLogic.SetState<TransferSaveState>();
+            Assert.Contains(connectionCollection.LoadingPeers, logic => logic.Peer == playerPeer);
+
+            connectionLogic.SetState<LoadingState>();
+            Assert.Contains(connectionCollection.LoadingPeers, logic => logic.Peer == playerPeer);
+
+            connectionLogic.SetState<CampaignState>();
+            Assert.Empty(connectionCollection.LoadingPeers);
+        }
+
+        [Fact]
+        public void HasCompletedCampaignSynchronization_ReadsStateOnce()
+        {
+            var connectPayload = new MessagePayload<PlayerConnected>(this, new PlayerConnected(playerPeer));
+            connectionCollection.PlayerJoiningHandler(connectPayload);
+            var missionState = connectionCollection.ConnectionStates[playerPeer].SetState<MissionState>();
+            var connection = new Mock<IConnectionLogic>();
+            connection.SetupGet(logic => logic.State).Returns(missionState);
+            connectionCollection.ConnectionStates[playerPeer] = connection.Object;
+
+            Assert.True(connectionCollection.HasCompletedCampaignSynchronization(playerPeer));
+            connection.VerifyGet(logic => logic.State, Times.Once);
+        }
+
+        [Fact]
+        public void HasCompletedCampaignSynchronization_AcceptsCampaignAndMissionStates()
+        {
+            var connectPayload = new MessagePayload<PlayerConnected>(this, new PlayerConnected(playerPeer));
+            connectionCollection.PlayerJoiningHandler(connectPayload);
+            var connection = connectionCollection.ConnectionStates[playerPeer];
+
+            connection.SetState<CampaignState>();
+            Assert.True(connectionCollection.HasCompletedCampaignSynchronization(playerPeer));
+
+            connection.SetState<MissionState>();
+            Assert.True(connectionCollection.HasCompletedCampaignSynchronization(playerPeer));
+        }
+
+        [Fact]
+        public void LoadingTransitions_BroadcastLoadingPlayersChangedOnChangeOnly()
+        {
+            // Arrange
+            var connectPayload = new MessagePayload<PlayerConnected>(this, new PlayerConnected(playerPeer));
+            connectionCollection.PlayerJoiningHandler(connectPayload);
+            var connectionLogic = connectionCollection.ConnectionStates[playerPeer];
+            serverComponent.TestMessageBroker.Messages.Clear();
+
+            // Act & Assert: entering a loading state broadcasts a count of 1.
+            connectionLogic.SetState<TransferSaveState>();
+            var loadingMessage = Assert.Single(serverComponent.TestMessageBroker.GetMessagesFromType<LoadingPlayersChanged>());
+            Assert.Equal(1, loadingMessage.LoadingPlayerCount);
+
+            // Staying loading (TransferSave -> Loading) does not re-broadcast an unchanged count.
+            serverComponent.TestMessageBroker.Messages.Clear();
+            connectionLogic.SetState<LoadingState>();
+            Assert.Empty(serverComponent.TestMessageBroker.GetMessagesFromType<LoadingPlayersChanged>());
+
+            // Leaving the loading states broadcasts a count of 0.
+            connectionLogic.SetState<CampaignState>();
+            var clearedMessage = Assert.Single(serverComponent.TestMessageBroker.GetMessagesFromType<LoadingPlayersChanged>());
+            Assert.Equal(0, clearedMessage.LoadingPlayerCount);
+        }
+    }
+}

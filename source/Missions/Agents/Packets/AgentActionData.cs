@@ -1,0 +1,845 @@
+﻿using ProtoBuf;
+using Missions.Agents.Handlers;
+#if DEBUG
+using Missions.Diagnostics;
+#endif
+using System;
+using System.Reflection;
+using TaleWorlds.Core;
+using TaleWorlds.Engine;
+using TaleWorlds.MountAndBlade;
+
+namespace Missions.Agents.Packets
+{
+    [ProtoContract(SkipConstructor = true)]
+    public class AgentActionData
+    {
+        internal const Agent.MovementControlFlag DefendMovementFlagsMask =
+            Agent.MovementControlFlag.DefendMask | Agent.MovementControlFlag.DefendBlock;
+
+        // MBAPI.IMBAnimation is a non-public static field. The publicizer makes it compile, but the
+        // emitted IgnoresAccessChecksTo isn't honored in every runtime load context (it throws
+        // FieldAccessException in live play). Reflecting a non-public static field always works, so
+        // resolve action names through here instead of touching MBAPI.IMBAnimation directly.
+        private static readonly FieldInfo AnimationField =
+            typeof(MBAPI).GetField("IMBAnimation", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+        private static MethodInfo getActionNameWithCode;
+
+        internal static string GetActionNameWithCode(int actionCode)
+        {
+            var animation = AnimationField?.GetValue(null);
+            if (animation == null) return null;
+
+            if (getActionNameWithCode == null)
+            {
+                getActionNameWithCode = animation.GetType().GetMethod("GetActionNameWithCode", new[] { typeof(int) });
+            }
+
+            return getActionNameWithCode?.Invoke(animation, new object[] { actionCode }) as string;
+        }
+
+        internal static bool TryResolveActionIndex(
+            int actionIndex,
+            out ActionIndexCache action)
+        {
+            string actionName = GetActionNameWithCode(actionIndex);
+            if (actionName != null)
+            {
+                action = ActionIndexCache.Create(actionName);
+                return action.Index >= 0;
+            }
+
+            // The E2E runtime has no animation resolver. Keep its narrow raw-index fallback without
+            // allowing an unknown wire index through when the live engine can validate it.
+            if (actionIndex >= 0 && AnimationField?.GetValue(null) == null)
+            {
+                action = new ActionIndexCache(actionIndex);
+                return true;
+            }
+
+            action = ActionIndexCache.act_none;
+            return false;
+        }
+
+        internal static Agent.MovementControlFlag GetDefendMovementFlags(
+            Agent.MovementControlFlag movementFlags)
+        {
+            return movementFlags & DefendMovementFlagsMask;
+        }
+
+        internal static Agent.MovementControlFlag GetEffectiveDefendMovementFlags(
+            Agent agent)
+        {
+            Agent.MovementControlFlag defendFlags =
+                GetDefendMovementFlags(agent.MovementFlags);
+            if (defendFlags != Agent.MovementControlFlag.None)
+                return defendFlags;
+
+            if (agent.HasMount)
+            {
+                defendFlags = GetDefendMovementFlags(
+                    agent.GetDefendMovementFlag());
+                // Mounted aim reports a defend direction even while idle. DefendBlock is the held-input bit.
+                if ((defendFlags & Agent.MovementControlFlag.DefendBlock) != 0)
+                    return defendFlags;
+            }
+
+            Agent.ActionCodeType action0Type = agent.GetCurrentActionType(0);
+            Agent.ActionCodeType action1Type = agent.GetCurrentActionType(1);
+            if (!IsDefendingAction(action0Type) && !IsDefendingAction(action1Type))
+                return Agent.MovementControlFlag.None;
+
+            // Guard actions can outlive the frame's defend flags, so recompute them while the action is active.
+            defendFlags = GetDefendMovementFlags(agent.GetDefendMovementFlag());
+            if (defendFlags != Agent.MovementControlFlag.None)
+                return defendFlags;
+
+            // Mounted directionless guards still need held defend input on the puppet. On foot, a lingering
+            // release animation must not synthesize a fresh block after native input has cleared.
+            return agent.HasMount
+                ? Agent.MovementControlFlag.DefendBlock
+                : Agent.MovementControlFlag.None;
+        }
+
+        internal static void ApplyDefendMovementFlags(
+            Agent agent,
+            Agent.MovementControlFlag defendFlags)
+        {
+            Agent.MovementControlFlag movementFlags =
+                agent.MovementFlags & ~DefendMovementFlagsMask;
+            agent.MovementFlags = movementFlags | GetDefendMovementFlags(defendFlags);
+        }
+
+        internal static void ApplyGuardState(
+            Agent agent,
+            Agent.GuardMode guardMode,
+            bool force = false)
+        {
+            if (IsGuardMode(guardMode))
+            {
+                if (force || agent.CurrentGuardMode != guardMode)
+                    agent.SetWeaponGuard(GuardModeToUsageDirection(guardMode));
+                return;
+            }
+
+            if (guardMode == Agent.GuardMode.None &&
+                (force || IsGuardMode(agent.CurrentGuardMode)))
+            {
+                agent.ResetGuard();
+            }
+        }
+
+        internal static void ApplyGuardDirectionTransition(
+            Agent agent,
+            Agent.GuardMode guardMode)
+        {
+            if (!IsGuardMode(guardMode))
+                return;
+
+            agent.ResetGuard();
+            ApplyGuardState(agent, guardMode, force: true);
+        }
+
+        private static void ClearMountedGuardDirectionAction(
+            Agent agent,
+            int channel)
+        {
+            // Retire the cyclic sibling before native guard input can select it again.
+#if DEBUG
+            MissionActionDiagnostics.RecordActionCommand(
+                agent,
+                channel,
+                ActionIndexCache.act_none.Index,
+                startProgress: 0f,
+                AnimFlags.anf_restart,
+                "mounted-guard-clear");
+#endif
+            agent.SetActionChannel(
+                channel,
+                ActionIndexCache.act_none,
+                ignorePriority: true,
+                additionalFlags: AnimFlags.anf_restart,
+                forceFaceMorphRestart: false);
+        }
+
+        internal static bool IsGuardMode(Agent.GuardMode guardMode) =>
+            guardMode == Agent.GuardMode.Up
+            || guardMode == Agent.GuardMode.Down
+            || guardMode == Agent.GuardMode.Left
+            || guardMode == Agent.GuardMode.Right;
+
+        internal static Agent.GuardMode GetGuardModeFromDefendFlags(
+            Agent.MovementControlFlag defendFlags)
+        {
+            if ((defendFlags & Agent.MovementControlFlag.DefendDown) != 0)
+                return Agent.GuardMode.Down;
+            if ((defendFlags & Agent.MovementControlFlag.DefendUp) != 0)
+                return Agent.GuardMode.Up;
+            if ((defendFlags & Agent.MovementControlFlag.DefendLeft) != 0)
+                return Agent.GuardMode.Left;
+            if ((defendFlags & Agent.MovementControlFlag.DefendRight) != 0)
+                return Agent.GuardMode.Right;
+
+            return Agent.GuardMode.None;
+        }
+
+        internal static Agent.GuardMode GetEffectiveGuardMode(
+            Agent agent,
+            Agent.MovementControlFlag defendFlags)
+        {
+            Agent.GuardMode guardMode = agent.CurrentGuardMode;
+            if (!agent.HasMount && IsGuardMode(guardMode))
+                return guardMode;
+
+            if (defendFlags == Agent.MovementControlFlag.None)
+            {
+                return IsGuardMode(guardMode)
+                    ? guardMode
+                    : Agent.GuardMode.None;
+            }
+
+            if (agent.HasMount)
+            {
+                guardMode = GetGuardModeFromDefendingAction(agent);
+                if (IsGuardMode(guardMode))
+                    return guardMode;
+            }
+
+            guardMode = agent.CurrentGuardMode;
+            if (IsGuardMode(guardMode))
+                return guardMode;
+
+            Agent.GuardMode flagGuardMode =
+                GetGuardModeFromDefendFlags(defendFlags);
+            if (IsGuardMode(flagGuardMode))
+                return flagGuardMode;
+
+            guardMode = GetGuardModeFromDefendDirection(
+                agent.GetCurrentActionDirection(1));
+            if (IsGuardMode(guardMode))
+                return guardMode;
+
+            return GetGuardModeFromDefendDirection(
+                agent.GetCurrentActionDirection(0));
+        }
+
+        internal static Agent.MovementControlFlag AlignDefendDirection(
+            Agent.MovementControlFlag defendFlags,
+            Agent.GuardMode guardMode)
+        {
+            if (defendFlags == Agent.MovementControlFlag.None ||
+                !IsGuardMode(guardMode))
+            {
+                return defendFlags;
+            }
+
+            return (defendFlags &
+                    ~Agent.MovementControlFlag.DefendDirMask) |
+                GuardModeToDefendFlag(guardMode);
+        }
+
+        internal static bool IsDefendingAction(Agent.ActionCodeType actionType)
+        {
+            return (actionType >= Agent.ActionCodeType.DefendAllBegin
+                    && actionType < Agent.ActionCodeType.DefendAllEnd)
+                || actionType == Agent.ActionCodeType.Guard;
+        }
+
+        internal static bool IsGuardPresentationAction(
+            Agent.ActionCodeType actionType)
+        {
+            return IsDefendingAction(actionType)
+                || IsGuardReactionAction(actionType);
+        }
+
+        internal static bool IsGuardReactionAction(
+            Agent.ActionCodeType actionType)
+        {
+            return actionType == Agent.ActionCodeType.ParriedMelee
+                || actionType == Agent.ActionCodeType.BlockedMelee;
+        }
+
+        private static int GetGuardPresentationChannel(Agent agent)
+        {
+            if (!agent.HasMount)
+                return -1;
+
+            Agent.ActionCodeType action1Type = agent.GetCurrentActionType(1);
+            Agent.ActionCodeType action0Type = agent.GetCurrentActionType(0);
+            if (IsGuardReactionAction(action1Type))
+                return 1;
+            if (IsGuardReactionAction(action0Type))
+                return 0;
+            if (IsDefendingAction(action1Type))
+                return 1;
+            if (IsDefendingAction(action0Type))
+                return 0;
+
+            return -1;
+        }
+
+        private static int GetGuardActionChannel(
+            Agent agent,
+            int guardPresentationChannel)
+        {
+            if (guardPresentationChannel >= 0)
+                return guardPresentationChannel;
+
+            if (IsDefendingAction(agent.GetCurrentActionType(1)))
+                return 1;
+            if (IsDefendingAction(agent.GetCurrentActionType(0)))
+                return 0;
+
+            return -1;
+        }
+
+        private static Agent.GuardMode GetGuardModeFromDefendDirection(
+            Agent.UsageDirection direction) =>
+            direction switch
+            {
+                Agent.UsageDirection.DefendUp => Agent.GuardMode.Up,
+                Agent.UsageDirection.DefendDown => Agent.GuardMode.Down,
+                Agent.UsageDirection.DefendLeft => Agent.GuardMode.Left,
+                Agent.UsageDirection.DefendRight => Agent.GuardMode.Right,
+                _ => Agent.GuardMode.None
+            };
+
+        internal static Agent.GuardMode GetGuardModeFromDefendingAction(
+            Agent agent)
+        {
+            Agent.GuardMode guardMode =
+                GetGuardModeFromDefendingAction(agent, 1);
+            return IsGuardMode(guardMode)
+                ? guardMode
+                : GetGuardModeFromDefendingAction(agent, 0);
+        }
+
+        internal static Agent.GuardMode GetGuardModeFromDefendingAction(
+            Agent agent,
+            int channel)
+        {
+            if (!IsDefendingAction(agent.GetCurrentActionType(channel)))
+                return Agent.GuardMode.None;
+
+            return GetGuardModeFromDefendDirection(
+                agent.GetCurrentActionDirection(channel));
+        }
+
+        private static Agent.MovementControlFlag GuardModeToDefendFlag(
+            Agent.GuardMode guardMode) =>
+            guardMode switch
+            {
+                Agent.GuardMode.Up =>
+                    Agent.MovementControlFlag.DefendUp,
+                Agent.GuardMode.Down =>
+                    Agent.MovementControlFlag.DefendDown,
+                Agent.GuardMode.Left =>
+                    Agent.MovementControlFlag.DefendLeft,
+                Agent.GuardMode.Right =>
+                    Agent.MovementControlFlag.DefendRight,
+                _ => Agent.MovementControlFlag.None
+            };
+
+        private static Agent.UsageDirection GuardModeToUsageDirection(
+            Agent.GuardMode guardMode) =>
+            guardMode switch
+            {
+                Agent.GuardMode.Up => Agent.UsageDirection.AttackUp,
+                Agent.GuardMode.Down => Agent.UsageDirection.AttackDown,
+                Agent.GuardMode.Left => Agent.UsageDirection.AttackLeft,
+                Agent.GuardMode.Right => Agent.UsageDirection.AttackRight,
+                _ => Agent.UsageDirection.None
+            };
+
+        private static int ToWireGuardState(Agent.GuardMode guardMode) =>
+            IsGuardMode(guardMode) ? (int)guardMode + 1 : 0;
+
+        private static Agent.GuardMode FromWireGuardState(int guardState) =>
+            guardState > 0 ? (Agent.GuardMode)(guardState - 1) : Agent.GuardMode.None;
+
+        public AgentActionData(Agent agent)
+            : this(agent, GetEffectiveDefendMovementFlags(agent))
+        {
+        }
+
+        private AgentActionData(
+            Agent agent,
+            Agent.MovementControlFlag defendFlags)
+            : this(
+                agent,
+                defendFlags,
+                GetEffectiveGuardMode(agent, defendFlags))
+        {
+        }
+
+        internal AgentActionData(
+            Agent agent,
+            Agent.MovementControlFlag defendFlags,
+            Agent.GuardMode guardMode,
+            int guardReactionChannel = -1)
+            : this(
+                agent,
+                defendFlags,
+                guardMode,
+                guardReactionChannel,
+                GetCurrentActionSpeed(agent, 0),
+                GetCurrentActionSpeed(agent, 1))
+        {
+        }
+
+        internal AgentActionData(
+            Agent agent,
+            Agent.MovementControlFlag defendFlags,
+            Agent.GuardMode guardMode,
+            int guardReactionChannel,
+            float? action0Speed,
+            float? action1Speed)
+        {
+            Equipment = AgentEquipmentData.TryCapture(agent, out var equipment)
+                ? equipment : (AgentEquipmentData?)null;
+            ActionIndexCache cache0 = agent.GetCurrentAction(0);
+            ActionIndexCache cache1 = agent.GetCurrentAction(1);
+            bool isPlayerControlled =
+                agent.Controller == AgentControllerType.Player;
+
+            if (IsGuardMode(guardMode))
+            {
+                defendFlags = AlignDefendDirection(
+                    defendFlags,
+                    guardMode);
+                if (isPlayerControlled)
+                {
+                    defendFlags |=
+                        Agent.MovementControlFlag.DefendBlock;
+                }
+            }
+
+            Agent.MovementControlFlag movementFlags = agent.MovementFlags;
+            movementFlags &= ~DefendMovementFlagsMask;
+            movementFlags |= defendFlags;
+
+            MovementFlag = (uint)movementFlags;
+            EventFlag = (uint)agent.EventControlFlags;
+            CrouchMode = agent.CrouchMode;
+            GuardState = ToWireGuardState(guardMode);
+
+            Action0Index = cache0.Index;
+            Action0Progress = agent.GetCurrentActionProgress(0);
+            Action0Flag = (ulong)agent.GetCurrentAnimationFlag(0);
+            Action0Speed = action0Speed;
+            Action1Index = cache1.Index;
+            Action1Progress = agent.GetCurrentActionProgress(1);
+            Action1Flag = (ulong)agent.GetCurrentAnimationFlag(1);
+            Action1Speed = action1Speed;
+            int validGuardReactionChannel =
+                guardReactionChannel >= 0
+                && guardReactionChannel <= 1
+                    ? guardReactionChannel
+                    : -1;
+            GuardPresentationChannel =
+                agent.HasMount && validGuardReactionChannel >= 0
+                    ? validGuardReactionChannel
+                    : GetGuardPresentationChannel(agent);
+            GuardActionChannel =
+                validGuardReactionChannel >= 0
+                    ? validGuardReactionChannel
+                    : GetGuardActionChannel(
+                        agent,
+                        GuardPresentationChannel);
+            GuardActionIsDefending =
+                GuardActionChannel >= 0
+                && IsDefendingAction(
+                    agent.GetCurrentActionType(
+                        GuardActionChannel));
+            GuardActionIsReaction =
+                GuardActionChannel >= 0
+                && (guardReactionChannel == GuardActionChannel
+                    || IsGuardReactionAction(
+                        agent.GetCurrentActionType(
+                            GuardActionChannel)));
+            IsMounted = agent.HasMount;
+            IsPlayerControlled = isPlayerControlled;
+        }
+
+        public void Apply(
+            Agent agent,
+            IAgentVisualActionAccessor visualActionAccessor,
+            bool suppressMountedGuardActionTransition = false,
+            bool neutralizeMountedGuardDirection = false)
+        {
+            Agent.MovementControlFlag movementFlags = (Agent.MovementControlFlag)MovementFlag;
+            agent.EventControlFlags |= (Agent.EventControlFlag)EventFlag;
+            if (neutralizeMountedGuardDirection)
+            {
+                movementFlags &=
+                    ~Agent.MovementControlFlag.DefendDirMask;
+            }
+            // Apply held input before action transitions so an explicit guard direction remains the final native command.
+            ApplyDefendMovementFlags(agent, movementFlags);
+
+            ApplyActionChannels(agent, visualActionAccessor, suppressMountedGuardActionTransition);
+        }
+
+        internal void ApplyActionChannels(
+            Agent agent,
+            IAgentVisualActionAccessor visualActionAccessor,
+            bool suppressMountedGuardActionTransition = false)
+        {
+            // Install action transitions, but let an unchanged native action advance on its local timeline.
+            ApplyActionChannel(
+                agent,
+                visualActionAccessor,
+                channel: 0,
+                Action0Index,
+                Action0Progress,
+                Action0Flag,
+                Action0Speed,
+                suppressMountedGuardActionTransition);
+            ApplyActionChannel(
+                agent,
+                visualActionAccessor,
+                channel: 1,
+                Action1Index,
+                Action1Progress,
+                Action1Flag,
+                Action1Speed,
+                suppressMountedGuardActionTransition);
+        }
+
+        private void ApplyActionChannel(
+            Agent agent,
+            IAgentVisualActionAccessor visualActionAccessor,
+            int channel,
+            int actionIndex,
+            float actionProgress,
+            ulong actionFlag,
+            float? actionSpeed,
+            bool suppressMountedGuardActionTransition)
+        {
+            bool suppressTransition =
+                ShouldSuppressReleasedPlayerGuardAction(channel)
+                || (suppressMountedGuardActionTransition
+                    && GuardActionChannel == channel)
+                || ShouldPreserveCurrentGuardReaction(agent, channel);
+            if (suppressTransition) return;
+
+            float resolvedActionSpeed = actionSpeed ?? 1f;
+            if (!NeedsActionTransition(
+                    agent,
+                    channel,
+                    actionIndex,
+                    visualActionAccessor,
+                    preserveVisibleAction:
+                        IsMounted && GuardActionChannel == channel,
+                    preserveCurrentGuardReaction: false))
+            {
+                if (actionSpeed.HasValue
+                    && actionIndex >= 0
+                    && agent.GetCurrentAction(channel).Index == actionIndex)
+                {
+                    agent.SetCurrentActionSpeed(channel, resolvedActionSpeed);
+                }
+                return;
+            }
+
+            if (!TryResolveActionTransition(
+                    agent,
+                    channel,
+                    actionIndex,
+                    out ActionIndexCache action))
+            {
+                return;
+            }
+
+            bool forceGuardDirectionTransition =
+                ShouldForceMountedGuardDirectionTransition(
+                    agent,
+                    channel);
+            AnimFlags actionFlags = (AnimFlags)actionFlag;
+            if (forceGuardDirectionTransition)
+            {
+                ClearMountedGuardDirectionAction(agent, channel);
+                ApplyGuardDirectionTransition(agent, GuardMode);
+                actionFlags |= AnimFlags.anf_restart;
+            }
+#if DEBUG
+            MissionActionDiagnostics.RecordActionCommand(
+                agent,
+                channel,
+                action.Index,
+                actionProgress,
+                actionFlags,
+                "action-packet");
+#endif
+            agent.SetActionChannel(
+                channel,
+                action,
+                ignorePriority: forceGuardDirectionTransition || action == ActionIndexCache.act_none,
+                additionalFlags: actionFlags,
+                actionSpeed: resolvedActionSpeed,
+                startProgress: actionProgress);
+        }
+
+        // Agent exposes only a speed setter, so read the rendered channel through its publicized skeleton API.
+        internal static float GetCurrentActionSpeed(Agent agent, int channel)
+        {
+            Skeleton skeleton = null;
+            try
+            {
+                MBAgentVisuals visuals = agent?.AgentVisuals;
+                if (ReferenceEquals(visuals, null) || !visuals.IsValid()) return 1f;
+
+                skeleton = visuals.GetSkeleton();
+                if (ReferenceEquals(skeleton, null)) return 1f;
+
+                float speed = skeleton.GetAnimationSpeedAtChannel(channel);
+                return float.IsNaN(speed) || float.IsInfinity(speed)
+                    ? 1f
+                    : Math.Max(0f, speed);
+            }
+            catch (NullReferenceException)
+            {
+                return 1f;
+            }
+            finally
+            {
+                if (!ReferenceEquals(skeleton, null))
+                    skeleton.ManualInvalidate();
+            }
+        }
+
+        private bool ShouldSuppressReleasedPlayerGuardAction(
+            int channel)
+        {
+            return IsPlayerControlled
+                && GuardActionChannel == channel
+                && GuardActionIsDefending
+                && DefendFlags == Agent.MovementControlFlag.None
+                && !IsGuardMode(GuardMode);
+        }
+
+        private bool TryResolveActionTransition(
+            Agent agent,
+            int channel,
+            int actionIndex,
+            out ActionIndexCache action)
+        {
+            // A released action has no animation name, but must clear the replicated use pose.
+            if (actionIndex == ActionIndexCache.act_none.Index)
+            {
+                action = ActionIndexCache.act_none;
+                // Retained guard cleanup releases its own action; other guard presentations decay locally.
+                return !IsGuardPresentationAction(agent.GetCurrentActionType(channel));
+            }
+
+            string actionName = GetActionNameWithCode(actionIndex);
+            if (actionName != null)
+            {
+                action = ActionIndexCache.Create(actionName);
+                return true;
+            }
+
+            Agent.GuardMode currentActionGuardMode =
+                GetGuardModeFromDefendDirection(
+                    agent.GetCurrentActionDirection(channel));
+            if (actionIndex >= 0
+                && IsMounted
+                && GuardActionChannel == channel
+                && IsGuardMode(GuardMode)
+                && IsGuardMode(currentActionGuardMode)
+                && currentActionGuardMode != GuardMode)
+            {
+                // The synchronized native index is sufficient when a stale sibling guard must transition.
+                action = new ActionIndexCache(actionIndex);
+                return true;
+            }
+
+            action = new ActionIndexCache(-1);
+            return false;
+        }
+
+        private bool ShouldForceMountedGuardDirectionTransition(
+            Agent agent,
+            int channel)
+        {
+            if (!IsMounted
+                || GuardActionChannel != channel
+                || !IsGuardMode(GuardMode))
+            {
+                return false;
+            }
+
+            Agent.GuardMode currentActionGuardMode =
+                GetGuardModeFromDefendDirection(
+                    agent.GetCurrentActionDirection(channel));
+            // Equal-priority mounted guard siblings can reject this one-shot transition.
+            return IsGuardMode(currentActionGuardMode)
+                && currentActionGuardMode != GuardMode;
+        }
+
+        private static bool NeedsActionTransition(
+            Agent agent,
+            int channel,
+            int expectedActionIndex,
+            IAgentVisualActionAccessor visualActionAccessor,
+            bool preserveVisibleAction,
+            bool preserveCurrentGuardReaction)
+        {
+            if (preserveCurrentGuardReaction)
+                return false;
+
+            ActionIndexCache currentAction =
+                agent.GetCurrentAction(channel);
+            if (currentAction != ActionIndexCache.act_none)
+                return currentAction.Index != expectedActionIndex;
+            if (expectedActionIndex == ActionIndexCache.act_none.Index)
+                return false;
+            if (!preserveVisibleAction)
+                return true;
+
+            ActionIndexCache expectedAction =
+                new ActionIndexCache(expectedActionIndex);
+            return !visualActionAccessor.IsActionVisible(
+                agent,
+                channel,
+                in expectedAction);
+        }
+
+        internal bool ShouldPreserveCurrentGuardReaction(
+            Agent agent,
+            int channel)
+        {
+            if (GuardActionIsReaction
+                || GuardActionChannel != channel
+                || !GuardActionIsDefending
+                || (DefendFlags == Agent.MovementControlFlag.None
+                    && !IsGuardMode(GuardMode)))
+            {
+                return false;
+            }
+
+            Agent.ActionCodeType actionType =
+                agent.GetCurrentActionType(channel);
+            if (IsGuardReactionAction(actionType))
+                return true;
+
+            Agent.GuardMode currentActionGuardMode =
+                GetGuardModeFromDefendDirection(
+                    agent.GetCurrentActionDirection(channel));
+            if (IsGuardMode(GuardMode)
+                && IsGuardMode(currentActionGuardMode)
+                && currentActionGuardMode != GuardMode)
+            {
+                return false;
+            }
+
+            return IsDefendingAction(actionType)
+                && agent.GetCurrentActionStage(channel)
+                    == Agent.ActionStage.DefendParry;
+        }
+
+        [ProtoMember(1)]
+        public float Action0Progress { get; }
+        [ProtoMember(2)]
+        public ulong Action0Flag { get; }
+        [ProtoMember(3)]
+        public int Action0Index { get; }
+        [ProtoMember(4)]
+        public float Action1Progress { get; }
+        [ProtoMember(5)]
+        public ulong Action1Flag { get; }
+        [ProtoMember(6)]
+        public int Action1Index { get; }
+        [ProtoMember(7)]
+        public uint MovementFlag { get; }
+        [ProtoMember(8)]
+        public uint EventFlag { get; }
+        [ProtoMember(9)]
+        public byte StateFlags { get; private set; }
+        [ProtoMember(10)]
+        public int GuardState { get; }
+        [ProtoMember(11)]
+        public int GuardPresentationChannel { get; }
+        [ProtoMember(12)]
+        public int GuardActionChannel { get; }
+        // Nullable keeps packets from older peers (where these fields are absent) at the native 1x default.
+        [ProtoMember(13)]
+        public float? Action0Speed { get; }
+        [ProtoMember(14)]
+        public float? Action1Speed { get; }
+        [ProtoMember(15)]
+        public AgentEquipmentData? Equipment { get; private set; }
+        [ProtoMember(16)]
+        public long EquipmentRevision { get; private set; }
+
+        [ProtoMember(17)]
+        public long AuthorityRevision { get; private set; }
+
+        [ProtoMember(18)]
+        public AgentPilotSeatData? PilotSeat { get; private set; }
+
+        internal AgentActionData WithPilotSeat(AgentPilotSeatData? pilotSeat)
+        {
+            var snapshot = (AgentActionData)MemberwiseClone();
+            snapshot.PilotSeat = pilotSeat;
+            return snapshot;
+        }
+
+        internal AgentActionData WithEquipment(long revision, AgentEquipmentData? equipment,
+            long? authorityRevision = null)
+        {
+            var snapshot = (AgentActionData)MemberwiseClone();
+            snapshot.EquipmentRevision = revision;
+            if (authorityRevision.HasValue) snapshot.AuthorityRevision = authorityRevision.Value;
+            snapshot.Equipment = equipment;
+            return snapshot;
+        }
+
+        [ProtoIgnore]
+        public bool CrouchMode
+        {
+            get => HasFlag(1);
+            private set => SetFlag(1, value);
+        }
+        [ProtoIgnore]
+        public bool IsMounted
+        {
+            get => HasFlag(2);
+            private set => SetFlag(2, value);
+        }
+        [ProtoIgnore]
+        public bool GuardActionIsDefending
+        {
+            get => HasFlag(4);
+            private set => SetFlag(4, value);
+        }
+        [ProtoIgnore]
+        public bool IsPlayerControlled
+        {
+            get => HasFlag(8);
+            private set => SetFlag(8, value);
+        }
+        [ProtoIgnore]
+        public bool GuardActionIsReaction
+        {
+            get => HasFlag(16);
+            private set => SetFlag(16, value);
+        }
+
+        private bool HasFlag(byte flag) =>
+            (StateFlags & flag) != 0;
+
+        private void SetFlag(
+            byte flag,
+            bool enabled)
+        {
+            StateFlags = enabled
+                ? (byte)(StateFlags | flag)
+                : (byte)(StateFlags & ~flag);
+        }
+
+        internal Agent.MovementControlFlag DefendFlags =>
+            GetDefendMovementFlags((Agent.MovementControlFlag)MovementFlag);
+        internal Agent.GuardMode GuardMode => FromWireGuardState(GuardState);
+    }
+}

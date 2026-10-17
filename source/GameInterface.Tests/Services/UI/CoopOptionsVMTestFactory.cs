@@ -1,0 +1,39 @@
+﻿using GameInterface.Services.UI.CoopOptions.Providers.UITab;
+using Common.Messaging;
+using GameInterface.Configuration;
+using GameInterface.Services.UI.CoopOptions;
+using GameInterface.Services.UI.CoopOptions.Providers;
+using GameInterface.Services.UI.CoopOptions.Providers.BugReportTab;
+using GameInterface.Services.UI.CoopOptions.Providers.ChatTab;
+using GameInterface.Services.UI.CoopOptions.Providers.KillFeedTab;
+using GameInterface.Services.UI.CoopOptions.Providers.MapTimeTab;
+using GameInterface.Services.UI.CoopOptions.Providers.NetworkTab;
+using GameInterface.Services.UI.CoopOptions.Providers.PlayerNameplatesTab;
+using System;
+using Xunit;
+
+namespace GameInterface.Tests.Services.UI;
+
+[CollectionDefinition(nameof(CoopOptionsViewModelCollection), DisableParallelization = true)]
+public sealed class CoopOptionsViewModelCollection { }
+
+internal static class CoopOptionsVMTestFactory
+{
+    public static CoopOptionsVM Create(
+        ICoopOptionsStore optionsStore,
+        IMessageBroker messageBroker,
+        Action close = null)
+    {
+        ICoopOptionsTabProvider[] providers =
+        {
+            new UIOptionsTabProvider(),
+            new NetworkOptionsTabProvider(),
+        };
+        return new CoopOptionsVM(
+            optionsStore,
+            messageBroker,
+            providers,
+            new ModOptions(new ModOptionsData()),
+            close ?? (() => { }));
+    }
+}

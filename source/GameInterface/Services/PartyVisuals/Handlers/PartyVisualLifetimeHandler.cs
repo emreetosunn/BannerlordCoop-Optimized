@@ -1,0 +1,136 @@
+﻿using Common;
+using Common.Messaging;
+using Common.Network;
+using Common.Util;
+using GameInterface.Services.ObjectManager;
+using GameInterface.Services.PartyBases.Extensions;
+using GameInterface.Services.PartyVisuals.Extensions;
+using GameInterface.Services.PartyVisuals.Messages;
+using SandBox.View.Map.Managers;
+using SandBox.View.Map.Visuals;
+using System.Runtime.CompilerServices;
+using TaleWorlds.CampaignSystem.Party;
+
+namespace GameInterface.Services.PartyVisuals.Handlers;
+
+public class PartyVisualLifetimeHandler : IHandler
+{
+    private readonly IMessageBroker messageBroker;
+    private readonly INetwork network;
+    private readonly IObjectManager objectManager;
+    private readonly ConditionalWeakTable<MobilePartyVisual, string> skippedVisualIds = new();
+
+    public PartyVisualLifetimeHandler(IMessageBroker messageBroker, INetwork network, IObjectManager objectManager)
+    {
+        this.messageBroker = messageBroker;
+        this.network = network;
+        this.objectManager = objectManager;
+        messageBroker.Subscribe<PartyVisualCreated>(Handle);
+        messageBroker.Subscribe<NetworkCreatePartyVisual>(Handle);
+        messageBroker.Subscribe<PartyVisualDestroyed>(Handle);
+        messageBroker.Subscribe<NetworkDestroyPartyVisual>(Handle);
+    }
+
+    public void Dispose()
+    {
+        messageBroker.Unsubscribe<PartyVisualCreated>(Handle);
+        messageBroker.Unsubscribe<NetworkCreatePartyVisual>(Handle);
+        messageBroker.Unsubscribe<PartyVisualDestroyed>(Handle);
+        messageBroker.Unsubscribe<NetworkDestroyPartyVisual>(Handle);
+    }
+
+    private void Handle(MessagePayload<PartyVisualCreated> payload)
+    {
+        // The visual is keyed off the mobile party. Replicate the mobile party id (always present on
+        // the server) rather than the party base id, whose MobileParty back-link the client syncs
+        // separately and may not have applied yet when the create arrives.
+        var mobileParty = payload.What.PartyBase?.MobileParty;
+        if (mobileParty == null)
+            return;
+
+        // Save loading builds visuals before InitialServerState registers campaign objects. Those
+        // visuals are registered by PartyVisualRegistry after loading, so skip this live-create path.
+        if (!objectManager.TryGetId(mobileParty, out string mobilePartyId))
+        {
+            if (!string.IsNullOrEmpty(mobileParty.StringId))
+            {
+                skippedVisualIds.Remove(payload.What.MobilePartyVisual);
+                skippedVisualIds.Add(
+                    payload.What.MobilePartyVisual,
+                    $"{nameof(MobilePartyVisual)}_{mobileParty.StringId}");
+            }
+            return;
+        }
+
+        if (!objectManager.AddNewObject(payload.What.MobilePartyVisual, out var visualId))
+            return;
+        if (!objectManager.TryGetHandleWithLogging(payload.What.MobilePartyVisual, out var visualHandle) ||
+            !objectManager.TryGetHandleWithLogging(mobileParty, out var mobilePartyHandle)) return;
+
+        network.SendAll(new NetworkCreatePartyVisual(visualId, visualHandle, mobilePartyHandle));
+    }
+
+    private void Handle(MessagePayload<NetworkCreatePartyVisual> payload)
+    {
+        var partyVisualId = payload.What.PartyVisualId;
+
+        // Resolve the party and build its visual on the main thread, in network order behind the
+        // party-creation handler that runs on the same FIFO game-loop queue. Resolving the id here
+        // (not on the poll thread) keeps it ordered behind that registration, and reads the mobile
+        // party directly rather than PartyBase.MobileParty, whose back-link the client syncs
+        // separately and may not have applied yet when this create arrives. The visuals manager
+        // mutates its party list here while OnTick walks it on the main thread, so this must not race.
+        GameThread.RunSafe(() =>
+        {
+            if (!objectManager.TryGetObjectWithLogging<MobileParty>(payload.What.MobilePartyHandle, out var mobileParty))
+                return;
+
+            using (new AllowedThread())
+            {
+                mobileParty.CreateNewPartyVisual();
+
+                var partyVisual = mobileParty.Party.GetPartyVisual();
+                if (partyVisual != null)
+                    objectManager.AddExisting(partyVisualId, partyVisual, payload.What.PartyVisualHandle);
+            }
+        }, context: $"create party visual {partyVisualId}");
+    }
+
+    private void Handle(MessagePayload<PartyVisualDestroyed> payload)
+    {
+        var partyVisual = payload.What.MobilePartyVisual;
+        var isRegistered = objectManager.TryGetId(partyVisual, out string partyVisualId);
+        if (!isRegistered && !skippedVisualIds.TryGetValue(partyVisual, out partyVisualId))
+        {
+            objectManager.TryGetIdWithLogging(partyVisual, out _);
+            return;
+        }
+
+        if (!objectManager.TryGetHandleWithLogging(payload.What.MobileParty, out var mobilePartyHandle))
+            return;
+
+        skippedVisualIds.Remove(partyVisual);
+        if (isRegistered)
+            objectManager.Remove(partyVisual);
+
+        network.SendAll(new NetworkDestroyPartyVisual(mobilePartyHandle));
+    }
+
+    private void Handle(MessagePayload<NetworkDestroyPartyVisual> payload)
+    {
+        GameThread.RunSafe(() =>
+        {
+            if (!objectManager.TryGetObjectWithLogging<MobileParty>(payload.What.MobilePartyHandle, out var mobileParty))
+                return;
+
+            using (new AllowedThread())
+            {
+                var partyVisual = mobileParty.Party.GetPartyVisual();
+                if (partyVisual != null)
+                    objectManager.Remove(partyVisual);
+
+                MobilePartyVisualManager.Current?.RemovePartyVisualForParty(mobileParty);
+            }
+        }, context: $"destroy party visual {payload.What.MobilePartyHandle}");
+    }
+}

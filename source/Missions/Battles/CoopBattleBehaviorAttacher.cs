@@ -1,0 +1,66 @@
+﻿using Common.Logging;
+using Common.Messaging;
+using Common.Network;
+using GameInterface.Services.MapEvents;
+using GameInterface.Services.Time.UI;
+using GameInterface.Services.UI.PlayerNameplates;
+using Serilog;
+using System;
+using TaleWorlds.MountAndBlade;
+
+namespace Missions.Battles;
+
+/// <inheritdoc cref="ICoopBattleBehaviorAttacher"/>
+internal class CoopBattleBehaviorAttacher : ICoopBattleBehaviorAttacher
+{
+    private static readonly ILogger Logger = LogManager.GetLogger<CoopBattleBehaviorAttacher>();
+    // Autofac-provided factory: CoopBattleController is registered InstancePerDependency, so each call
+    // builds a fresh controller that lives and is disposed with its mission.
+    private readonly Func<CoopBattleController> controllerFactory;
+#if DEBUG
+    private readonly Func<SiegeInteractionDebugBehavior> siegeInteractionDebugFactory;
+#endif
+    private readonly IMessageBroker messageBroker;
+    private readonly INetwork relayNetwork;
+    private readonly Func<MissionMapTimeView> mapTimeViewFactory;
+    private readonly Func<PlayerNameplateMissionView> playerNameplateViewFactory;
+
+    public CoopBattleBehaviorAttacher(
+        Func<CoopBattleController> controllerFactory,
+        Func<MissionMapTimeView> mapTimeViewFactory,
+        Func<PlayerNameplateMissionView> playerNameplateViewFactory,
+#if DEBUG
+        Func<SiegeInteractionDebugBehavior> siegeInteractionDebugFactory,
+#endif
+        IMessageBroker messageBroker,
+        INetwork relayNetwork)
+    {
+        this.controllerFactory = controllerFactory;
+        this.mapTimeViewFactory = mapTimeViewFactory;
+        this.playerNameplateViewFactory = playerNameplateViewFactory;
+        this.messageBroker = messageBroker;
+#if DEBUG
+        this.siegeInteractionDebugFactory = siegeInteractionDebugFactory;
+#endif
+        this.relayNetwork = relayNetwork;
+    }
+
+    public void Attach(Mission mission)
+    {
+        var controller = controllerFactory();
+        mission.AddMissionBehavior(controller);
+#if DEBUG
+        mission.AddMissionBehavior(siegeInteractionDebugFactory());
+#endif
+        mission.AddMissionBehavior(mapTimeViewFactory());
+        mission.AddMissionBehavior(playerNameplateViewFactory());
+        mission.AddMissionBehavior(new BattleResultReadyLogic(
+            controller.ResultCommitter,
+            controller.SiegeEngineStateReporter,
+            messageBroker,
+            controller.Session,
+            controller.Deployment,
+            relayNetwork));
+        Logger.Information("[BattleSync] Attached coop battle behaviors to mission '{Scene}'", mission.SceneName);
+    }
+}
